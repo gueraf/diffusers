@@ -891,6 +891,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
 
         h = lambda_t - lambda_s0
         device = sample.device
+        h = h.to(device)
 
         rks = []
         D1s = []
@@ -1026,6 +1027,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
 
         h = lambda_t - lambda_s0
         device = this_sample.device
+        h = h.to(device)
 
         rks = []
         D1s = []
