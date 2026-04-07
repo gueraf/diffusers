@@ -16,7 +16,7 @@ Guidance scale should be low (1.0–2.0); DMD models don't need strong CFG.
 Usage:
     python examples/inference/autoregressive_video_generation.py \
         --prompt "A cat walks on the grass, realistic" \
-        --num_chunks 5 \
+        --num_chunks 14 \
         --frames_per_chunk 17 \
         --output output.mp4
 
@@ -39,7 +39,7 @@ from diffusers.utils import export_to_video
 def generate_autoregressive_video(
     prompt: str,
     negative_prompt: str = "",
-    num_chunks: int = 5,
+    num_chunks: int = 14,
     frames_per_chunk: int = 17,
     height: int = 480,
     width: int = 832,
@@ -62,15 +62,18 @@ def generate_autoregressive_video(
             by model_id, so this does not determine generation style.
 
     The process:
-    1. Generate the first chunk of frames (output_type="latent" to skip VAE decode).
-    2. Run a clean transformer forward pass at t=0 with those exact denoised latents
+    1. Prepare scheduler timesteps and encode the prompt once.
+    2. For each chunk, run the full denoising loop manually, passing the correct
+       frame_offset so that temporal RoPE positions continue across chunks
+       (chunk i uses positions i*ppf .. (i+1)*ppf - 1 instead of 0 .. ppf-1).
+    3. After denoising, run a clean forward pass at t=0 (with should_update_cache=True)
        to populate the rolling KV cache with accurate clean K/V projections.
-    3. For each subsequent chunk, repeat — the denoising self-attention attends
-       to all previous chunks' cached K/V, giving temporal coherence.
     4. Decode all chunk latents at the end with the VAE.
 
-    Using output_type="latent" is critical: it avoids re-encoding decoded frames
-    through the VAE (which introduces reconstruction artifacts into the cache).
+    The frame_offset fix is critical: without it every chunk computes RoPE with
+    positions 0..ppf-1, making the cached K/V from prior chunks positionally
+    indistinguishable from the current chunk — causing visible jumps at every
+    chunk boundary.
     """
     # Load Self-Forcing transformer; VAE and text encoder from the Wan base model
     transformer = WanTransformer3DModel.from_pretrained(model_id, torch_dtype=torch.bfloat16)
@@ -87,25 +90,35 @@ def generate_autoregressive_video(
     ))
     cache_state = get_rolling_kv_cache_state(pipe.transformer)
 
-    # Pre-encode prompt once; reuse across chunks and clean forward passes
+    # Encode prompt once; reuse across all chunks and clean forward passes
     with torch.no_grad():
-        prompt_embeds, _ = pipe.encode_prompt(
+        prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
             prompt=prompt,
-            negative_prompt=None,
-            do_classifier_free_guidance=False,
+            negative_prompt=negative_prompt if negative_prompt else None,
+            do_classifier_free_guidance=guidance_scale > 1.0,
             device=device,
             dtype=torch.bfloat16,
         )
 
+    # Latent shape
+    p_t, p_h, p_w = pipe.transformer.config.patch_size
+    z_dim = pipe.vae.config.z_dim
+    latent_h = height // pipe.vae_scale_factor_spatial
+    latent_w = width // pipe.vae_scale_factor_spatial
+    latent_t = (frames_per_chunk - 1) // pipe.vae_scale_factor_temporal + 1
+
+    # Frames per chunk in patch space (for frame_offset computation)
+    ppf = latent_t // p_t
+
     # VAE latent denormalization constants (needed to decode chunk latents)
     latents_mean = (
         torch.tensor(pipe.vae.config.latents_mean)
-        .view(1, pipe.vae.config.z_dim, 1, 1, 1)
+        .view(1, z_dim, 1, 1, 1)
         .to(device, dtype=torch.float32)
     )
     latents_std_inv = (
         (1.0 / torch.tensor(pipe.vae.config.latents_std))
-        .view(1, pipe.vae.config.z_dim, 1, 1, 1)
+        .view(1, z_dim, 1, 1, 1)
         .to(device, dtype=torch.float32)
     )
 
@@ -115,33 +128,53 @@ def generate_autoregressive_video(
     for chunk_idx in range(num_chunks):
         print(f"Generating chunk {chunk_idx + 1}/{num_chunks}...")
 
-        # Denoise with cache reads enabled but writes suppressed (avoids caching
-        # noisy intermediate K/V from diffusion steps)
-        cache_state.should_update_cache = False
+        # Absolute temporal frame offset for this chunk's RoPE positions
+        frame_offset = chunk_idx * ppf
 
-        output = pipe(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=height,
-            width=width,
-            num_frames=frames_per_chunk,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
+        # Reset scheduler state for each chunk's independent denoising trajectory
+        pipe.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = pipe.scheduler.timesteps
+
+        # Initialize latent noise for this chunk
+        latents = torch.randn(
+            (1, z_dim, latent_t, latent_h, latent_w),
             generator=generator,
-            output_type="latent",  # stay in latent space — no VAE decode yet
+            device=device,
+            dtype=torch.bfloat16,
         )
-        # chunk_latents: (1, C, T_latent, H_latent, W_latent) in model-normalised space
-        chunk_latents = output.frames.to(dtype=torch.bfloat16)
+        latents = latents * pipe.scheduler.init_noise_sigma
 
-        # Populate the cache with K/V from these exact denoised latents.
-        # Using the latents directly (no re-encode) gives an accurate cache.
+        # Denoising loop — cache reads on, writes off (avoids storing noisy K/V)
+        cache_state.should_update_cache = False
+        with torch.no_grad():
+            for t in timesteps:
+                latent_model_input = pipe.scheduler.scale_model_input(latents, t)
+                timestep = t.expand(latents.shape[0])
+
+                noise_pred = pipe.transformer(
+                    latent_model_input,
+                    timestep=timestep,
+                    encoder_hidden_states=prompt_embeds,
+                    frame_offset=frame_offset,
+                    return_dict=False,
+                )[0]
+
+                latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+        # chunk_latents: (1, C, latent_t, latent_h, latent_w) in model-normalised space
+        chunk_latents = latents.to(dtype=torch.bfloat16)
+
+        # Populate the cache with clean K/V from these denoised latents at t=0.
+        # Using the denoised latents directly (no VAE round-trip) gives accurate K/V.
         cache_state.should_update_cache = True
         with torch.no_grad():
-            timestep = torch.zeros(1, device=device, dtype=torch.long)
+            zero_timestep = torch.zeros(1, device=device, dtype=torch.long)
             pipe.transformer(
                 chunk_latents,
-                timestep=timestep,
+                timestep=zero_timestep,
                 encoder_hidden_states=prompt_embeds,
+                frame_offset=frame_offset,
+                return_dict=False,
             )
 
         # Decode this chunk for the output video
@@ -168,7 +201,7 @@ def main():
         type=str,
         default="Bright tones, overexposed, static, blurred details, subtitles, worst quality, low quality",
     )
-    parser.add_argument("--num_chunks", type=int, default=5, help="Number of video chunks to generate")
+    parser.add_argument("--num_chunks", type=int, default=14, help="Number of video chunks to generate")
     parser.add_argument("--frames_per_chunk", type=int, default=17, help="Frames per chunk (must be 4k+1)")
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
@@ -196,7 +229,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=str, default="autoregressive_output.mp4")
-    parser.add_argument("--fps", type=int, default=15)
+    parser.add_argument("--fps", type=int, default=16)
     args = parser.parse_args()
 
     frames = generate_autoregressive_video(

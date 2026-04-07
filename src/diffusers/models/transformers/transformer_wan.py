@@ -392,7 +392,7 @@ class WanRotaryPosEmbed(nn.Module):
         self.register_buffer("freqs_cos", torch.cat(freqs_cos, dim=1), persistent=False)
         self.register_buffer("freqs_sin", torch.cat(freqs_sin, dim=1), persistent=False)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, frame_offset: int = 0) -> torch.Tensor:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.patch_size
         ppf, pph, ppw = num_frames // p_t, height // p_h, width // p_w
@@ -402,11 +402,11 @@ class WanRotaryPosEmbed(nn.Module):
         freqs_cos = self.freqs_cos.split(split_sizes, dim=1)
         freqs_sin = self.freqs_sin.split(split_sizes, dim=1)
 
-        freqs_cos_f = freqs_cos[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_cos_f = freqs_cos[0][frame_offset:frame_offset + ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_cos_h = freqs_cos[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_cos_w = freqs_cos[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
 
-        freqs_sin_f = freqs_sin[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_sin_f = freqs_sin[0][frame_offset:frame_offset + ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_sin_h = freqs_sin[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_sin_w = freqs_sin[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
 
@@ -634,6 +634,7 @@ class WanTransformer3DModel(
         encoder_hidden_states_image: torch.Tensor | None = None,
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
+        frame_offset: int = 0,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
@@ -641,7 +642,7 @@ class WanTransformer3DModel(
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        rotary_emb = self.rope(hidden_states)
+        rotary_emb = self.rope(hidden_states, frame_offset=frame_offset)
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
