@@ -9,15 +9,25 @@ The rolling KV cache stores self-attention key/value projections from previously
 generated chunks so that each new chunk can attend to past context without
 recomputing all previous tokens.
 
-Note: gueraf/Self-Forcing-diffusers is a DMD-distilled model. Use
-num_inference_steps=4 (default) for best results — more steps over-denoise.
-Guidance scale should be low (1.0–2.0); DMD models don't need strong CFG.
+Inference procedure:
+  Self-Forcing DMD was trained with a specific 4-step stochastic schedule
+  (NOT a standard ODE solver). At each step:
+    1. Predict x0 from noisy input at timestep t
+    2. Re-noise x0 back to the NEXT timestep t' (stochastic re-noising)
+    3. Repeat until final step; use last x0 as the clean chunk
+
+  The timesteps are derived from a FlowMatchEuler schedule with shift=5.0,
+  matching the original training: approximately [1000, 938, 834, 629].
+  Using UniPC or any standard ODE solver produces garbage because the model
+  was not trained with those timestep sequences.
+
+  Each chunk uses 3 latent frames (= 9 pixel frames), matching the training
+  block size (num_frame_per_block=3 in the original config).
 
 Usage:
-    python examples/inference/autoregressive_video_generation.py \
-        --prompt "A cat walks on the grass, realistic" \
-        --num_chunks 14 \
-        --frames_per_chunk 17 \
+    python examples/inference/autoregressive_video_generation.py \\
+        --prompt "A cat walks on the grass, realistic" \\
+        --num_chunks 27 \\
         --output output.mp4
 
 Requirements:
@@ -31,19 +41,33 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 import torch
-from diffusers import AutoencoderKLWan, WanPipeline, WanTransformer3DModel
+from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler, WanPipeline, WanTransformer3DModel
 from diffusers.hooks import RollingKVCacheConfig, apply_rolling_kv_cache, get_rolling_kv_cache_state
 from diffusers.utils import export_to_video
+
+
+def _build_sf_denoising_steps(device):
+    """Compute the Self-Forcing DMD 4-step warped timestep schedule.
+
+    Original: denoising_step_list=[1000, 750, 500, 250], warp_denoising_step=True,
+    timestep_shift=5.0.  The warping picks timesteps[1000 - step] from a 1000-step
+    FlowMatchEuler schedule with shift=5.0, giving approximately
+    [1000, 938, 834, 629] in the [0, 1000] timestep range.
+    """
+    sched = FlowMatchEulerDiscreteScheduler(shift=5.0, num_train_timesteps=1000)
+    sched.set_timesteps(1000, device="cpu")
+    all_ts = torch.cat([sched.timesteps.cpu(), torch.tensor([0.0])])
+    orig = torch.tensor([1000, 750, 500, 250])
+    return all_ts[1000 - orig].to(device)
 
 
 def generate_autoregressive_video(
     prompt: str,
     negative_prompt: str = "",
-    num_chunks: int = 14,
-    frames_per_chunk: int = 17,
+    num_chunks: int = 27,
+    frames_per_chunk: int = 9,
     height: int = 480,
     width: int = 832,
-    num_inference_steps: int = 4,
     guidance_scale: float = 1.0,
     window_size: int = 8000,
     model_id: str = "gueraf/Self-Forcing-diffusers",
@@ -55,33 +79,23 @@ def generate_autoregressive_video(
 
     Args:
         model_id: Self-Forcing transformer repo (gueraf/Self-Forcing-diffusers).
-            This is the autoregressive model — it was trained for chunk-based
-            generation and should be the primary model you configure.
-        wan_base_model_id: Wan2.1-T2V base repo, used only to load the VAE,
-            text encoder, tokenizer, and scheduler. The transformer is replaced
-            by model_id, so this does not determine generation style.
-
-    The process:
-    1. Prepare scheduler timesteps and encode the prompt once.
-    2. For each chunk, run the full denoising loop manually, passing the correct
-       frame_offset so that temporal RoPE positions continue across chunks
-       (chunk i uses positions i*ppf .. (i+1)*ppf - 1 instead of 0 .. ppf-1).
-    3. After denoising, run a clean forward pass at t=0 (with should_update_cache=True)
-       to populate the rolling KV cache with accurate clean K/V projections.
-    4. Decode all chunk latents at the end with the VAE.
-
-    The frame_offset fix is critical: without it every chunk computes RoPE with
-    positions 0..ppf-1, making the cached K/V from prior chunks positionally
-    indistinguishable from the current chunk — causing visible jumps at every
-    chunk boundary.
+        wan_base_model_id: Wan2.1-T2V base repo — used only for VAE, text encoder,
+            tokenizer. The transformer is replaced by model_id.
+        frames_per_chunk: Pixel frames per chunk. Must satisfy
+            (frames_per_chunk - 1) % 4 == 0. Default 9 = 3 latent frames,
+            matching the training block size (num_frame_per_block=3).
+        num_chunks: Number of chunks. 27 chunks × 9 frames = 243px ≈ 15s @ 16fps.
     """
-    # Load Self-Forcing transformer; VAE and text encoder from the Wan base model
     transformer = WanTransformer3DModel.from_pretrained(model_id, torch_dtype=torch.bfloat16)
     vae = AutoencoderKLWan.from_pretrained(wan_base_model_id, subfolder="vae", torch_dtype=torch.float32)
     pipe = WanPipeline.from_pretrained(
         wan_base_model_id, vae=vae, transformer=transformer, torch_dtype=torch.bfloat16
     )
     pipe.to(device)
+
+    # Self-Forcing was trained with FlowMatchEuler + shift=5.0, NOT UniPC.
+    # Replace the default scheduler so that add_noise() uses the correct sigma math.
+    pipe.scheduler = FlowMatchEulerDiscreteScheduler(shift=5.0, num_train_timesteps=1000)
 
     # Apply rolling KV cache
     apply_rolling_kv_cache(pipe.transformer, RollingKVCacheConfig(
@@ -90,27 +104,31 @@ def generate_autoregressive_video(
     ))
     cache_state = get_rolling_kv_cache_state(pipe.transformer)
 
+    # 4-step warped timestep schedule matching original Self-Forcing training
+    denoising_steps = _build_sf_denoising_steps(device=device)  # ~[1000, 938, 834, 629]
+
     # Encode prompt once; reuse across all chunks and clean forward passes
+    do_cfg = guidance_scale > 1.0
     with torch.no_grad():
         prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
             prompt=prompt,
             negative_prompt=negative_prompt if negative_prompt else None,
-            do_classifier_free_guidance=guidance_scale > 1.0,
+            do_classifier_free_guidance=do_cfg,
             device=device,
             dtype=torch.bfloat16,
         )
 
-    # Latent shape
+    # Latent dimensions
     p_t, p_h, p_w = pipe.transformer.config.patch_size
     z_dim = pipe.vae.config.z_dim
     latent_h = height // pipe.vae_scale_factor_spatial
     latent_w = width // pipe.vae_scale_factor_spatial
     latent_t = (frames_per_chunk - 1) // pipe.vae_scale_factor_temporal + 1
 
-    # Frames per chunk in patch space (for frame_offset computation)
+    # Frames per chunk in patch space (for frame_offset)
     ppf = latent_t // p_t
 
-    # VAE latent denormalization constants (needed to decode chunk latents)
+    # VAE denormalization constants for decoding
     latents_mean = (
         torch.tensor(pipe.vae.config.latents_mean)
         .view(1, z_dim, 1, 1, 1)
@@ -128,50 +146,61 @@ def generate_autoregressive_video(
     for chunk_idx in range(num_chunks):
         print(f"Generating chunk {chunk_idx + 1}/{num_chunks}...")
 
-        # Absolute temporal frame offset for this chunk's RoPE positions
         frame_offset = chunk_idx * ppf
 
-        # Reset scheduler state for each chunk's independent denoising trajectory
-        pipe.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = pipe.scheduler.timesteps
-
-        # Initialize latent noise for this chunk
-        latents = torch.randn(
+        # Initialize with pure noise at sigma=1.0 (t=1000)
+        noisy_input = torch.randn(
             (1, z_dim, latent_t, latent_h, latent_w),
             generator=generator,
             device=device,
             dtype=torch.bfloat16,
         )
-        latents = latents * pipe.scheduler.init_noise_sigma
 
-        # Denoising loop — cache reads on, writes off (avoids storing noisy K/V)
+        # Self-Forcing DMD denoising: predict x0, re-noise to next level, repeat.
+        # Cache reads on; writes off during noisy denoising (avoid storing noisy K/V).
         cache_state.should_update_cache = False
         with torch.no_grad():
-            for t in timesteps:
-                latent_model_input = pipe.scheduler.scale_model_input(latents, t)
-                timestep = t.expand(latents.shape[0])
+            for step_idx, t in enumerate(denoising_steps):
+                sigma = t / 1000.0  # ∈ [0, 1], scalar
 
-                noise_pred = pipe.transformer(
-                    latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    frame_offset=frame_offset,
-                    return_dict=False,
-                )[0]
+                encoder_hs = prompt_embeds
+                if do_cfg:
+                    # Run unconditional and conditional passes
+                    latent_input = torch.cat([noisy_input, noisy_input])
+                    ts = t.long().expand(2)
+                    enc = torch.cat([negative_prompt_embeds, prompt_embeds])
+                    velocity = pipe.transformer(
+                        latent_input, timestep=ts, encoder_hidden_states=enc,
+                        frame_offset=frame_offset, return_dict=False,
+                    )[0]
+                    vel_uncond, vel_cond = velocity.chunk(2)
+                    velocity = vel_uncond + guidance_scale * (vel_cond - vel_uncond)
+                else:
+                    velocity = pipe.transformer(
+                        noisy_input,
+                        timestep=t.long().expand(noisy_input.shape[0]),
+                        encoder_hidden_states=encoder_hs,
+                        frame_offset=frame_offset,
+                        return_dict=False,
+                    )[0]
 
-                latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                # Flow matching: x0 = xt - sigma * velocity
+                x0_pred = (noisy_input.float() - sigma * velocity.float()).to(torch.bfloat16)
 
-        # chunk_latents: (1, C, latent_t, latent_h, latent_w) in model-normalised space
-        chunk_latents = latents.to(dtype=torch.bfloat16)
+                if step_idx < len(denoising_steps) - 1:
+                    # Re-noise x0 to the NEXT noise level: xt' = (1 - sigma') * x0 + sigma' * eps
+                    next_sigma = denoising_steps[step_idx + 1] / 1000.0
+                    eps = torch.randn_like(x0_pred)
+                    noisy_input = ((1.0 - next_sigma) * x0_pred + next_sigma * eps).to(torch.bfloat16)
+
+        chunk_latents = x0_pred
 
         # Populate the cache with clean K/V from these denoised latents at t=0.
-        # Using the denoised latents directly (no VAE round-trip) gives accurate K/V.
         cache_state.should_update_cache = True
         with torch.no_grad():
-            zero_timestep = torch.zeros(1, device=device, dtype=torch.long)
             pipe.transformer(
                 chunk_latents,
-                timestep=zero_timestep,
+                timestep=torch.zeros(1, device=device, dtype=torch.long),
                 encoder_hidden_states=prompt_embeds,
                 frame_offset=frame_offset,
                 return_dict=False,
@@ -201,17 +230,15 @@ def main():
         type=str,
         default="Bright tones, overexposed, static, blurred details, subtitles, worst quality, low quality",
     )
-    parser.add_argument("--num_chunks", type=int, default=14, help="Number of video chunks to generate")
-    parser.add_argument("--frames_per_chunk", type=int, default=17, help="Frames per chunk (must be 4k+1)")
+    parser.add_argument("--num_chunks", type=int, default=27,
+                        help="Number of video chunks. 27 × 9px frames = 243px ≈ 15s @ 16fps")
+    parser.add_argument("--frames_per_chunk", type=int, default=9,
+                        help="Pixel frames per chunk (must be 4k+1). 9=3 latent frames (training block size).")
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument(
-        "--num_inference_steps", type=int, default=4,
-        help="Diffusion steps. Self-Forcing-DMD works best at 1-4 steps.",
-    )
-    parser.add_argument(
         "--guidance_scale", type=float, default=1.0,
-        help="CFG scale. DMD models need low values (1.0-2.0).",
+        help="CFG scale. DMD models were trained without CFG; 1.0 = no guidance.",
     )
     parser.add_argument("--window_size", type=int, default=8000, help="Rolling cache window (-1 for unlimited)")
     parser.add_argument(
@@ -239,7 +266,6 @@ def main():
         frames_per_chunk=args.frames_per_chunk,
         height=args.height,
         width=args.width,
-        num_inference_steps=args.num_inference_steps,
         guidance_scale=args.guidance_scale,
         window_size=args.window_size,
         model_id=args.model_id,
