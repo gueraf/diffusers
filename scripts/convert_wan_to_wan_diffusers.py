@@ -66,7 +66,7 @@ WAN_T2V_1_3B_CONFIG = {
     "freq_dim": 256,
     "ffn_dim": 8960,
     "num_layers": 30,
-    "cross_attn_norm": False,
+    "cross_attn_norm": True,
     "qk_norm": "rms_norm_across_heads",
     "eps": 1e-6,
     "image_dim": None,

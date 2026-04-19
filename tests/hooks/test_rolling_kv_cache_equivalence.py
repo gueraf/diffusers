@@ -116,14 +116,12 @@ def _load_original_checkpoint():
 
 
 def _original_to_diffusers_sd(orig_sd):
-    """Apply key renaming + filter out non-existent keys (rope buffers, norm2 with cross_attn_norm=False)."""
+    """Apply key renaming + filter out non-parameter rope buffers."""
     out = {}
     for k, v in orig_sd.items():
         if "rope" in k and "freqs" in k:
             continue  # registered buffers, not parameters
         nk = _rename_key(k)
-        if ".norm2." in nk:
-            continue  # cross_attn_norm=False: norm2 doesn't exist in T2V
         out[nk] = v
     return out
 

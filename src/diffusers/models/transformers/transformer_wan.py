@@ -30,7 +30,7 @@ from ..cache_utils import CacheMixin
 from ..embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps, get_1d_rotary_pos_embed
 from ..modeling_outputs import Transformer2DModelOutput
 from ..modeling_utils import ModelMixin
-from ..normalization import FP32LayerNorm
+from ..normalization import FP32LayerNorm, RMSNorm
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -106,10 +106,13 @@ class WanAttnProcessor:
                 freqs_cos: torch.Tensor,
                 freqs_sin: torch.Tensor,
             ):
-                x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
-                cos = freqs_cos[..., 0::2]
-                sin = freqs_sin[..., 1::2]
-                out = torch.empty_like(hidden_states)
+                hidden_states_fp64 = hidden_states.to(torch.float64)
+                freqs_cos_fp64 = freqs_cos.to(torch.float64)
+                freqs_sin_fp64 = freqs_sin.to(torch.float64)
+                x1, x2 = hidden_states_fp64.unflatten(-1, (-1, 2)).unbind(-1)
+                cos = freqs_cos_fp64[..., 0::2]
+                sin = freqs_sin_fp64[..., 1::2]
+                out = torch.empty_like(hidden_states_fp64)
                 out[..., 0::2] = x1 * cos - x2 * sin
                 out[..., 1::2] = x1 * sin + x2 * cos
                 return out.type_as(hidden_states)
@@ -205,8 +208,8 @@ class WanAttention(torch.nn.Module, AttentionModuleMixin):
                 torch.nn.Dropout(dropout),
             ]
         )
-        self.norm_q = torch.nn.RMSNorm(dim_head * heads, eps=eps, elementwise_affine=True)
-        self.norm_k = torch.nn.RMSNorm(dim_head * heads, eps=eps, elementwise_affine=True)
+        self.norm_q = RMSNorm(dim_head * heads, eps=eps, elementwise_affine=True)
+        self.norm_k = RMSNorm(dim_head * heads, eps=eps, elementwise_affine=True)
 
         self.add_k_proj = self.add_v_proj = None
         if added_kv_proj_dim is not None:

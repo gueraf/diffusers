@@ -30,6 +30,13 @@ class TestConvertWanToDiffusersHelpers(unittest.TestCase):
         renamed = MODULE.rename_key("blocks.0.self_attn.q.weight")
         self.assertEqual(renamed, "blocks.0.attn1.to_q.weight")
 
+    def test_rename_key_maps_cross_attention_norm_to_diffusers_norm2(self):
+        renamed = MODULE.rename_key("blocks.0.norm3.weight")
+        self.assertEqual(renamed, "blocks.0.norm2.weight")
+
+    def test_self_forcing_uses_cross_attention_norm(self):
+        self.assertTrue(MODULE.WAN_T2V_1_3B_CONFIG["cross_attn_norm"])
+
     def test_equivalence_report_counts_exact_matches(self):
         reference = {
             "foo": torch.tensor([1.0, 2.0]),

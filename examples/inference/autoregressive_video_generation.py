@@ -187,6 +187,17 @@ def _generate_chunk_velocity(
         )[0]
 
 
+def _sample_self_forcing_renoise(latents, *, generator=None):
+    batch_size, channels, num_frames, height, width = latents.shape
+    noise = torch.randn(
+        (batch_size, num_frames, channels, height, width),
+        generator=generator,
+        device=latents.device,
+        dtype=latents.dtype,
+    )
+    return noise.permute(0, 2, 1, 3, 4).contiguous()
+
+
 def generate_autoregressive_video(
     prompt,
     negative_prompt="",
@@ -314,7 +325,7 @@ def generate_autoregressive_video(
                 velocity = _generate_chunk_velocity(
                     pipe,
                     noisy_input,
-                    timestep=timestep.long().expand(noisy_input.shape[0]),
+                    timestep=timestep.expand(noisy_input.shape[0]),
                     prompt_embeds=prompt_embeds,
                     negative_prompt_embeds=negative_prompt_embeds,
                     guidance_scale=guidance_scale,
@@ -324,12 +335,7 @@ def generate_autoregressive_video(
 
                 if step_idx < len(denoising_steps) - 1:
                     next_sigma = denoising_steps[step_idx + 1] / 1000.0
-                    eps = torch.randn(
-                        x0_pred.shape,
-                        generator=generator,
-                        device=x0_pred.device,
-                        dtype=x0_pred.dtype,
-                    )
+                    eps = _sample_self_forcing_renoise(x0_pred, generator=generator)
                     noisy_input = ((1.0 - next_sigma) * x0_pred + next_sigma * eps).to(torch.bfloat16)
 
         prefill_rolling_kv_cache(
