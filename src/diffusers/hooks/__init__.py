@@ -25,7 +25,12 @@ if is_torch_available():
     from .layerwise_casting import apply_layerwise_casting, apply_layerwise_casting_hook
     from .mag_cache import MagCacheConfig, apply_mag_cache
     from .pyramid_attention_broadcast import PyramidAttentionBroadcastConfig, apply_pyramid_attention_broadcast
-    from .rolling_kv_cache import RollingKVCacheConfig, apply_rolling_kv_cache, get_rolling_kv_cache_state
+    from .rolling_kv_cache import (
+        RollingKVCacheConfig,
+        apply_rolling_kv_cache,
+        get_rolling_kv_cache_state,
+        prefill_rolling_kv_cache,
+    )
     from .smoothed_energy_guidance_utils import SmoothedEnergyGuidanceConfig
     from .taylorseer_cache import TaylorSeerCacheConfig, apply_taylorseer_cache
     from .text_kv_cache import TextKVCacheConfig, apply_text_kv_cache
