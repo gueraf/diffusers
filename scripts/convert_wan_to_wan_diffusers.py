@@ -18,6 +18,7 @@ import sys
 
 import numpy as np
 import torch
+from PIL import Image
 from safetensors.torch import load_file, save_file
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -130,9 +131,28 @@ def _compute_video_psnr(reference_frames, candidate_frames):
     return 20.0 * np.log10(255.0) - 10.0 * np.log10(mse)
 
 
+def _load_reference_frames(reference_video_path, reference_frames_dir, height, width):
+    from diffusers import VideoProcessor
+    from diffusers.utils import load_video
+
+    processor = VideoProcessor()
+
+    if reference_frames_dir is not None:
+        frame_paths = sorted(pathlib.Path(reference_frames_dir).glob("*.png"))
+        if not frame_paths:
+            raise ValueError(f"No `.png` frames found under {reference_frames_dir}.")
+        reference_frames = [Image.open(path).convert("RGB") for path in frame_paths]
+    else:
+        reference_frames = load_video(reference_video_path)
+
+    reference_tensor = processor.preprocess_video(reference_frames, height=height, width=width)
+    return processor.postprocess_video(reference_tensor, output_type="pil")[0]
+
+
 def _validate_reference_video_psnr(
     model_path,
     reference_video_path,
+    reference_frames_dir,
     prompt,
     negative_prompt,
     wan_base_model_id,
@@ -143,10 +163,11 @@ def _validate_reference_video_psnr(
     seed,
     fps,
     device,
+    text_encoder_device,
+    vae_device,
     validation_output_path,
 ):
-    from diffusers import VideoProcessor
-    from diffusers.utils import export_to_video, load_video
+    from diffusers.utils import export_to_video
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "examples", "inference"))
     from autoregressive_video_generation import generate_autoregressive_video
@@ -162,13 +183,17 @@ def _validate_reference_video_psnr(
         model_id=model_path,
         wan_base_model_id=wan_base_model_id,
         device=device,
+        text_encoder_device=text_encoder_device,
+        vae_device=vae_device,
         seed=seed,
     )
 
-    processor = VideoProcessor()
-    reference_frames = load_video(reference_video_path)
-    reference_tensor = processor.preprocess_video(reference_frames, height=height, width=width)
-    reference_frames = processor.postprocess_video(reference_tensor, output_type="pil")[0]
+    reference_frames = _load_reference_frames(
+        reference_video_path=reference_video_path,
+        reference_frames_dir=reference_frames_dir,
+        height=height,
+        width=width,
+    )
 
     frame_count = min(len(reference_frames), len(generated_frames))
     psnr = _compute_video_psnr(reference_frames[:frame_count], generated_frames[:frame_count])
@@ -178,6 +203,7 @@ def _validate_reference_video_psnr(
 
     return {
         "reference_video_path": reference_video_path,
+        "reference_frames_dir": reference_frames_dir,
         "validation_output_path": validation_output_path,
         "num_compared_frames": frame_count,
         "psnr_db": psnr,
@@ -275,6 +301,7 @@ def main():
     parser.add_argument("--no_ema", action="store_true")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--reference_video", type=str, default=None)
+    parser.add_argument("--reference_frames_dir", type=str, default=None)
     parser.add_argument("--validation_prompt", type=str, default="A cat walks on the grass, realistic")
     parser.add_argument(
         "--validation_negative_prompt",
@@ -289,6 +316,8 @@ def main():
     parser.add_argument("--validation_seed", type=int, default=0)
     parser.add_argument("--validation_fps", type=int, default=16)
     parser.add_argument("--validation_device", type=str, default="cuda")
+    parser.add_argument("--validation_text_encoder_device", type=str, default=None)
+    parser.add_argument("--validation_vae_device", type=str, default=None)
     args = parser.parse_args()
 
     output_dir, validation_report_path = convert_self_forcing_checkpoint(
@@ -298,10 +327,11 @@ def main():
         device=args.device,
     )
 
-    if args.reference_video is not None:
+    if args.reference_video is not None or args.reference_frames_dir is not None:
         psnr_report = _validate_reference_video_psnr(
             model_path=str(output_dir),
             reference_video_path=args.reference_video,
+            reference_frames_dir=args.reference_frames_dir,
             prompt=args.validation_prompt,
             negative_prompt=args.validation_negative_prompt,
             wan_base_model_id=args.wan_base_model_id,
@@ -312,6 +342,8 @@ def main():
             seed=args.validation_seed,
             fps=args.validation_fps,
             device=args.validation_device,
+            text_encoder_device=args.validation_text_encoder_device,
+            vae_device=args.validation_vae_device,
             validation_output_path=str(output_dir / "validation_video.mp4"),
         )
 

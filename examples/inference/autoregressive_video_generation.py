@@ -25,6 +25,7 @@ import sys
 
 import numpy as np
 import torch
+from transformers import AutoTokenizer, UMT5EncoderModel
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
@@ -63,9 +64,13 @@ def _get_latent_stats(pipe, device):
 
 
 def _decode_latent_chunk(pipe, latents, latents_mean, latents_std):
-    decode_latents = latents.to(dtype=pipe.vae.dtype)
+    vae_device = next(pipe.vae.parameters()).device
+    decode_latents = latents.to(device=vae_device, dtype=pipe.vae.dtype)
+    latents_mean = latents_mean.to(device=vae_device, dtype=torch.float32)
+    latents_std = latents_std.to(device=vae_device, dtype=torch.float32)
     decode_latents = decode_latents / latents_std + latents_mean
-    video = pipe.vae.decode(decode_latents, return_dict=False)[0]
+    with torch.no_grad():
+        video = pipe.vae.decode(decode_latents, return_dict=False)[0]
     return pipe.video_processor.postprocess_video(video, output_type="pil")[0]
 
 
@@ -78,6 +83,44 @@ def _compute_psnr(reference_frames, candidate_frames):
     return 20.0 * np.log10(255.0) - 10.0 * np.log10(mse)
 
 
+def _load_pipeline(model_id, wan_base_model_id, device, text_encoder_device=None, vae_device=None):
+    transformer = WanTransformer3DModel.from_pretrained(model_id, torch_dtype=torch.bfloat16)
+    vae = AutoencoderKLWan.from_pretrained(wan_base_model_id, subfolder="vae", torch_dtype=torch.float32)
+    vae_device = vae_device or device
+
+    if text_encoder_device is None and vae_device == device:
+        pipe = WanPipeline.from_pretrained(
+            wan_base_model_id,
+            vae=vae,
+            transformer=transformer,
+            torch_dtype=torch.bfloat16,
+        )
+        pipe.scheduler = FlowMatchEulerDiscreteScheduler(shift=5.0, num_train_timesteps=1000)
+        pipe.to(device)
+        return pipe, device
+
+    text_encoder_device = text_encoder_device or device
+    text_encoder_dtype = torch.float32 if text_encoder_device == "cpu" else torch.bfloat16
+    tokenizer = AutoTokenizer.from_pretrained(wan_base_model_id, subfolder="tokenizer")
+    text_encoder = UMT5EncoderModel.from_pretrained(
+        wan_base_model_id,
+        subfolder="text_encoder",
+        torch_dtype=text_encoder_dtype,
+    )
+    text_encoder.to(text_encoder_device)
+
+    pipe = WanPipeline(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        vae=vae,
+        scheduler=FlowMatchEulerDiscreteScheduler(shift=5.0, num_train_timesteps=1000),
+        transformer=transformer,
+    )
+    pipe.transformer.to(device)
+    pipe.vae.to(vae_device)
+    return pipe, text_encoder_device
+
+
 def _chunk_video_frames(video_frames, frames_per_chunk):
     if len(video_frames) % frames_per_chunk != 0:
         raise ValueError(
@@ -86,13 +129,18 @@ def _chunk_video_frames(video_frames, frames_per_chunk):
     return [video_frames[idx : idx + frames_per_chunk] for idx in range(0, len(video_frames), frames_per_chunk)]
 
 
-def _encode_reference_chunk(pipe, frames, height, width, latents_mean, latents_std, device):
-    reference_video = pipe.video_processor.preprocess_video(frames, height=height, width=width).to(device, torch.float32)
+def _encode_reference_chunk(pipe, frames, height, width, latents_mean, latents_std, vae_device, transformer_device):
+    reference_video = pipe.video_processor.preprocess_video(frames, height=height, width=width).to(vae_device, torch.float32)
     reference_frames = pipe.video_processor.postprocess_video(reference_video, output_type="pil")[0]
-    encoded = _retrieve_latents(pipe.vae.encode(reference_video.to(dtype=pipe.vae.dtype)), sample_mode="argmax")
+    with torch.no_grad():
+        encoded = _retrieve_latents(pipe.vae.encode(reference_video.to(dtype=pipe.vae.dtype)), sample_mode="argmax")
     encoded = (encoded.to(torch.float32) - latents_mean) * latents_std
     decoded_frames = _decode_latent_chunk(pipe, encoded, latents_mean, latents_std)
-    return encoded.to(dtype=pipe.transformer.dtype), decoded_frames, _compute_psnr(reference_frames, decoded_frames)
+    return (
+        encoded.to(device=transformer_device, dtype=pipe.transformer.dtype),
+        decoded_frames,
+        _compute_psnr(reference_frames, decoded_frames),
+    )
 
 
 def _set_cache_update_mode(transformer, should_update_cache, contexts):
@@ -153,18 +201,17 @@ def generate_autoregressive_video(
     conditioning_video=None,
     conditioning_start_chunk=0,
     device="cuda",
+    text_encoder_device=None,
+    vae_device=None,
     seed=0,
 ):
-    transformer = WanTransformer3DModel.from_pretrained(model_id, torch_dtype=torch.bfloat16)
-    vae = AutoencoderKLWan.from_pretrained(wan_base_model_id, subfolder="vae", torch_dtype=torch.float32)
-    pipe = WanPipeline.from_pretrained(
-        wan_base_model_id,
-        vae=vae,
-        transformer=transformer,
-        torch_dtype=torch.bfloat16,
+    pipe, prompt_device = _load_pipeline(
+        model_id=model_id,
+        wan_base_model_id=wan_base_model_id,
+        device=device,
+        text_encoder_device=text_encoder_device,
+        vae_device=vae_device,
     )
-    pipe.scheduler = FlowMatchEulerDiscreteScheduler(shift=5.0, num_train_timesteps=1000)
-    pipe.to(device)
     pipe.transformer.enable_cache(
         RollingKVCacheConfig(window_size=window_size, cache_cross_attention=True)
     )
@@ -172,29 +219,48 @@ def generate_autoregressive_video(
     denoising_steps = _build_sf_denoising_steps(device=device)
     do_cfg = guidance_scale > 1.0
     cache_contexts = ["cond", "uncond"] if do_cfg else ["cond"]
+    prompt_dtype = torch.float32 if prompt_device == "cpu" else torch.bfloat16
 
     with torch.no_grad():
         prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
             prompt=prompt,
             negative_prompt=negative_prompt if negative_prompt else None,
             do_classifier_free_guidance=do_cfg,
-            device=device,
-            dtype=torch.bfloat16,
+            device=prompt_device,
+            dtype=prompt_dtype,
         )
+        prompt_embeds = prompt_embeds.to(device=device, dtype=torch.bfloat16)
+        if negative_prompt_embeds is not None:
+            negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=torch.bfloat16)
+
+    if text_encoder_device is not None and text_encoder_device != "cpu":
+        pipe.text_encoder.to("cpu")
+        if str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
 
     p_t, _, _ = pipe.transformer.config.patch_size
     latent_h = height // pipe.vae_scale_factor_spatial
     latent_w = width // pipe.vae_scale_factor_spatial
     latent_t = (frames_per_chunk - 1) // pipe.vae_scale_factor_temporal + 1
     patch_frames_per_chunk = latent_t // p_t
-    latents_mean, latents_std = _get_latent_stats(pipe, device)
+    vae_device = next(pipe.vae.parameters()).device
+    latents_mean, latents_std = _get_latent_stats(pipe, vae_device)
 
     reference_chunks = []
     if conditioning_video is not None:
         video_frames = load_video(conditioning_video)
         for chunk_frames in _chunk_video_frames(video_frames, frames_per_chunk):
             reference_chunks.append(
-                _encode_reference_chunk(pipe, chunk_frames, height, width, latents_mean, latents_std, device)
+                _encode_reference_chunk(
+                    pipe,
+                    chunk_frames,
+                    height,
+                    width,
+                    latents_mean,
+                    latents_std,
+                    vae_device=vae_device,
+                    transformer_device=device,
+                )
             )
         if conditioning_start_chunk + len(reference_chunks) > num_chunks:
             raise ValueError("`conditioning_video` would write past `num_chunks`.")
@@ -258,7 +324,12 @@ def generate_autoregressive_video(
 
                 if step_idx < len(denoising_steps) - 1:
                     next_sigma = denoising_steps[step_idx + 1] / 1000.0
-                    eps = torch.randn_like(x0_pred)
+                    eps = torch.randn(
+                        x0_pred.shape,
+                        generator=generator,
+                        device=x0_pred.device,
+                        dtype=x0_pred.dtype,
+                    )
                     noisy_input = ((1.0 - next_sigma) * x0_pred + next_sigma * eps).to(torch.bfloat16)
 
         prefill_rolling_kv_cache(
@@ -303,6 +374,8 @@ def main():
     parser.add_argument("--conditioning_video", type=str, default=None)
     parser.add_argument("--conditioning_start_chunk", type=int, default=0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--text_encoder_device", default=None)
+    parser.add_argument("--vae_device", default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", default="autoregressive_output.mp4")
     parser.add_argument("--fps", type=int, default=16)
@@ -322,6 +395,8 @@ def main():
         conditioning_video=args.conditioning_video,
         conditioning_start_chunk=args.conditioning_start_chunk,
         device=args.device,
+        text_encoder_device=args.text_encoder_device,
+        vae_device=args.vae_device,
         seed=args.seed,
     )
     export_to_video(frames, args.output, fps=args.fps)

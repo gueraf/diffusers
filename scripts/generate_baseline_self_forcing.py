@@ -30,6 +30,8 @@ def main():
     parser.add_argument("--model_id", default="gueraf/Self-Forcing-diffusers")
     parser.add_argument("--wan_base_model_id", default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--text_encoder_device", default=None)
+    parser.add_argument("--vae_device", default=None)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -46,6 +48,8 @@ def main():
             model_id=args.model_id,
             wan_base_model_id=args.wan_base_model_id,
             device=args.device,
+            text_encoder_device=args.text_encoder_device,
+            vae_device=args.vae_device,
             seed=args.seed,
         )
         output_path = os.path.join(args.output_dir, f"baseline_{prompt_idx:02d}.mp4")
