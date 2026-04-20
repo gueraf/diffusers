@@ -318,6 +318,22 @@ class TestApplyRollingKVCache(unittest.TestCase):
         self.assertEqual(helper_cache_state.write_mode, "append")
         self.assertIsNone(helper_cache_state.absolute_token_offset)
 
+    def test_cache_context_restores_outer_context_after_nested_scope(self):
+        hs_a, ts, enc = _make_inputs()
+        hs_b, _, _ = _make_inputs()
+
+        with self.transformer.cache_context("cond"):
+            _run_chunk(self.transformer, hs_a, ts, enc, frame_offset=0)
+            prefill_rolling_kv_cache(self.transformer, hs_b, enc, frame_offset=1, cache_context="cond")
+            outer_state = get_rolling_kv_cache_state(self.transformer)
+            self.assertIsNotNone(outer_state)
+            self.assertEqual(outer_state.write_mode, "append")
+
+        block_state_manager = _get_self_hook(self.transformer).block_state_manager
+        block_state_manager.set_context("cond")
+        block_state = block_state_manager.get_state()
+        self.assertEqual(block_state.cached_key.shape[1], _TOKENS_PER_CHUNK * 2)
+
     def test_reset_stateful_hooks_clears_cache(self):
         hidden_states, timestep, encoder_hidden_states = _make_inputs()
         _run_chunk(self.transformer, hidden_states, timestep, encoder_hidden_states, frame_offset=0)

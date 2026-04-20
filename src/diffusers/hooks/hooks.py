@@ -217,6 +217,24 @@ class HookRegistry:
     def get_hook(self, name: str) -> ModelHook | None:
         return self.hooks.get(name, None)
 
+    def _get_context(self) -> str | None:
+        for hook in self.hooks.values():
+            for attr_name in dir(hook):
+                attr = getattr(hook, attr_name)
+                if isinstance(attr, StateManager):
+                    return attr._current_context
+
+        for module_name, module in unwrap_module(self._module_ref).named_modules():
+            if module_name == "":
+                continue
+            module = unwrap_module(module)
+            if hasattr(module, "_diffusers_hook"):
+                context = module._diffusers_hook._get_context()
+                if context is not None:
+                    return context
+
+        return None
+
     def remove_hook(self, name: str, recurse: bool = True) -> None:
         if name in self.hooks.keys():
             num_hooks = len(self._hook_order)
