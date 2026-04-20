@@ -105,12 +105,9 @@ class RollingKVCacheCrossAttnBlockState(BaseState):
 
 
 def _apply_wan_rotary_emb(hidden_states: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor):
-    x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
-    cos = freqs_cos[..., 0::2]
-    sin = freqs_sin[..., 1::2]
-    out = torch.empty_like(hidden_states)
-    out[..., 0::2] = x1 * cos - x2 * sin
-    out[..., 1::2] = x1 * sin + x2 * cos
+    hidden_states_complex = torch.view_as_complex(hidden_states.to(torch.float64).reshape(*hidden_states.shape[:-1], -1, 2))
+    freqs_complex = torch.complex(freqs_cos[..., 0::2].to(torch.float64), freqs_sin[..., 0::2].to(torch.float64))
+    out = torch.view_as_real(hidden_states_complex * freqs_complex).flatten(-2)
     return out.type_as(hidden_states)
 
 
@@ -529,7 +526,8 @@ def prefill_rolling_kv_cache(
                 cache_state.configure_cache_write(write_mode=write_mode, absolute_token_offset=token_offset)
 
                 if timestep is None:
-                    chunk_timestep = torch.zeros(chunk.shape[0], device=chunk.device, dtype=torch.long)
+                    patch_frames = chunk.shape[2] // transformer.config.patch_size[0]
+                    chunk_timestep = torch.zeros((chunk.shape[0], patch_frames), device=chunk.device, dtype=torch.long)
                 elif timestep.ndim == 0:
                     chunk_timestep = timestep.to(device=chunk.device).expand(chunk.shape[0])
                 else:

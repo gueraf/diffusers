@@ -179,6 +179,20 @@ class TestApplyWanRotaryEmb(unittest.TestCase):
         out = _apply_wan_rotary_emb(x, freqs_cos, freqs_sin)
         self.assertEqual(out.dtype, x.dtype)
 
+    def test_matches_complex_reference(self):
+        x = torch.randn(1, 4, 2, 16, dtype=torch.bfloat16)
+        freqs_cos = torch.randn(1, 4, 1, 16, dtype=torch.float32)
+        freqs_sin = torch.randn(1, 4, 1, 16, dtype=torch.float32)
+
+        expected = torch.view_as_real(
+            torch.view_as_complex(x.to(torch.float64).reshape(*x.shape[:-1], -1, 2))
+            * torch.complex(freqs_cos[..., 0::2].to(torch.float64), freqs_sin[..., 0::2].to(torch.float64))
+        ).flatten(-2).to(x.dtype)
+
+        out = _apply_wan_rotary_emb(x, freqs_cos, freqs_sin)
+
+        torch.testing.assert_close(out, expected)
+
 
 class TestApplyRollingKVCache(unittest.TestCase):
     def setUp(self):
@@ -317,6 +331,32 @@ class TestApplyRollingKVCache(unittest.TestCase):
         helper_cache_state = get_rolling_kv_cache_state(helper)
         self.assertEqual(helper_cache_state.write_mode, "append")
         self.assertIsNone(helper_cache_state.absolute_token_offset)
+
+    def test_prefill_without_timestep_uses_per_frame_zero_timestep_shape(self):
+        hidden_states, _, encoder_hidden_states = _make_inputs(t=2)
+
+        transformer = _make_transformer()
+        transformer.eval()
+        apply_rolling_kv_cache(transformer, RollingKVCacheConfig(window_size=-1, cache_cross_attention=False))
+
+        captured = {}
+
+        def _capture_forward(
+            hidden_states,
+            timestep,
+            encoder_hidden_states,
+            frame_offset=0,
+            return_dict=False,
+            **kwargs,
+        ):
+            captured["timestep_shape"] = tuple(timestep.shape)
+            return (torch.zeros_like(hidden_states),)
+
+        transformer.forward = _capture_forward
+
+        prefill_rolling_kv_cache(transformer, hidden_states, encoder_hidden_states, frame_offset=0)
+
+        self.assertEqual(captured["timestep_shape"], (hidden_states.shape[0], hidden_states.shape[2]))
 
     def test_cache_context_restores_outer_context_after_nested_scope(self):
         hs_a, ts, enc = _make_inputs()
