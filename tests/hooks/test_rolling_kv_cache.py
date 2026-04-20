@@ -257,6 +257,22 @@ class TestApplyRollingKVCache(unittest.TestCase):
 
         self.assertFalse(torch.allclose(out_with_cache, out_no_cache))
 
+    def test_transformer_accepts_per_frame_timesteps(self):
+        transformer = _make_transformer()
+        transformer.eval()
+        hidden_states, _, encoder_hidden_states = _make_inputs(t=2)
+        timestep = torch.full((hidden_states.shape[0], hidden_states.shape[2]), 937.5, dtype=torch.float32)
+
+        with torch.no_grad():
+            output = transformer(
+                hidden_states,
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states,
+                frame_offset=0,
+            ).sample
+
+        self.assertEqual(output.shape, hidden_states.shape)
+
     def test_overwrite_truncates_suffix_and_matches_rebuilt_prefix(self):
         hs_a, ts_a, enc = _make_inputs()
         hs_b, ts_b, _ = _make_inputs()
@@ -317,6 +333,29 @@ class TestApplyRollingKVCache(unittest.TestCase):
         helper_cache_state = get_rolling_kv_cache_state(helper)
         self.assertEqual(helper_cache_state.write_mode, "append")
         self.assertIsNone(helper_cache_state.absolute_token_offset)
+
+    def test_prefill_helper_defaults_to_per_frame_zero_timestep(self):
+        hs_a, _, enc = _make_inputs(t=2)
+        explicit = _make_transformer()
+        explicit.load_state_dict(self.transformer.state_dict())
+        explicit.eval()
+        apply_rolling_kv_cache(explicit, RollingKVCacheConfig(window_size=-1, cache_cross_attention=False))
+
+        implicit = _make_transformer()
+        implicit.load_state_dict(self.transformer.state_dict())
+        implicit.eval()
+        apply_rolling_kv_cache(implicit, RollingKVCacheConfig(window_size=-1, cache_cross_attention=False))
+
+        timestep = torch.zeros((hs_a.shape[0], hs_a.shape[2]), dtype=torch.long)
+        prefill_rolling_kv_cache(explicit, hs_a, enc, frame_offset=0, timestep=timestep)
+        prefill_rolling_kv_cache(implicit, hs_a, enc, frame_offset=0)
+
+        explicit_state = _get_block_state(explicit)
+        implicit_state = _get_block_state(implicit)
+
+        self.assertEqual(implicit_state.cache_start_token_offset, explicit_state.cache_start_token_offset)
+        torch.testing.assert_close(implicit_state.cached_key, explicit_state.cached_key)
+        torch.testing.assert_close(implicit_state.cached_value, explicit_state.cached_value)
 
     def test_reset_stateful_hooks_clears_cache(self):
         hidden_states, timestep, encoder_hidden_states = _make_inputs()

@@ -22,7 +22,7 @@ from transformers import UMT5EncoderModel
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from diffusers import FlowMatchEulerDiscreteScheduler, WanTransformer3DModel
+from diffusers import WanTransformer3DModel
 from diffusers.hooks import RollingKVCacheConfig, get_rolling_kv_cache_state, prefill_rolling_kv_cache
 from diffusers.utils import export_to_video
 
@@ -38,9 +38,10 @@ def _manual_seed_all(seed):
 
 
 def _build_sf_denoising_steps(device):
-    scheduler = FlowMatchEulerDiscreteScheduler(shift=5.0, num_train_timesteps=1000)
-    scheduler.set_timesteps(1000, device="cpu")
-    all_timesteps = torch.cat([scheduler.timesteps.cpu(), torch.tensor([0.0])])
+    # Match guandeh17/Self-Forcing's custom FlowMatchScheduler exactly.
+    sigmas = torch.linspace(1.0, 0.0, 1001)[:-1]
+    sigmas = 5.0 * sigmas / (1.0 + 4.0 * sigmas)
+    all_timesteps = torch.cat([sigmas * 1000.0, torch.tensor([0.0])])
     original_schedule = torch.tensor([1000, 750, 500, 250])
     return all_timesteps[1000 - original_schedule].to(device=device, dtype=torch.float32)
 
@@ -65,6 +66,13 @@ def _compute_framewise_psnr(reference_frames, candidate_frames):
         else:
             psnrs.append(20.0 * np.log10(255.0) - 10.0 * np.log10(mse))
     return psnrs
+
+
+def _frame_to_token_offset(transformer, latents, frame_offset):
+    _, _, _, height, width = latents.shape
+    _, p_h, p_w = transformer.config.patch_size
+    patches_per_frame = (height // p_h) * (width // p_w)
+    return frame_offset * patches_per_frame
 
 
 def _video_tensor_to_pil(video):
@@ -122,6 +130,7 @@ def _load_upstream_modules(upstream_repo_path):
     wan_wrapper_mod = importlib.import_module("utils.wan_wrapper")
     causal_model_mod = importlib.import_module("wan.modules.causal_model")
     tokenizer_mod = importlib.import_module("wan.modules.tokenizers")
+    t5_mod = importlib.import_module("wan.modules.t5")
     vae_mod = importlib.import_module("wan.modules.vae")
 
     return {
@@ -130,6 +139,7 @@ def _load_upstream_modules(upstream_repo_path):
         "WanDiffusionWrapper": wan_wrapper_mod.WanDiffusionWrapper,
         "CausalWanModel": causal_model_mod.CausalWanModel,
         "HuggingfaceTokenizer": tokenizer_mod.HuggingfaceTokenizer,
+        "umt5_xxl": t5_mod.umt5_xxl,
         "_video_vae": vae_mod._video_vae,
     }
 
@@ -157,7 +167,7 @@ class HFTextEncoder(torch.nn.Module):
             tensor[seq_len:] = 0.0
 
         return {
-            "prompt_embeds": context.to(device=self.output_device, dtype=torch.bfloat16)
+            "prompt_embeds": context.to(device=self.output_device)
         }
 
 
@@ -170,6 +180,72 @@ class FixedTextEncoder(torch.nn.Module):
         return {
             "prompt_embeds": self.conditional_dict["prompt_embeds"].clone()
         }
+
+
+class UpstreamTextEncoder(torch.nn.Module):
+    def __init__(self, tokenizer_cls, text_encoder_factory, upstream_repo_path, device, output_device):
+        super().__init__()
+        model_dir = pathlib.Path(upstream_repo_path) / "wan_models" / "Wan2.1-T2V-1.3B"
+        tokenizer_path = model_dir / "google" / "umt5-xxl"
+        weights_path = model_dir / "models_t5_umt5-xxl-enc-bf16.pth"
+        encoder_dtype = torch.float32 if str(device) == "cpu" else torch.bfloat16
+
+        self.tokenizer = tokenizer_cls(name=str(tokenizer_path), seq_len=512, clean="whitespace")
+        self.text_encoder = text_encoder_factory(
+            encoder_only=True,
+            return_tokenizer=False,
+            dtype=encoder_dtype,
+            device=torch.device("cpu"),
+        ).eval().requires_grad_(False)
+        self.text_encoder.load_state_dict(torch.load(weights_path, map_location="cpu", weights_only=False))
+        self.text_encoder.to(device=device, dtype=encoder_dtype)
+        self.device = _resolve_device(device)
+        self.output_device = _resolve_device(output_device)
+
+    @torch.no_grad()
+    def forward(self, text_prompts):
+        ids, mask = self.tokenizer(text_prompts, return_mask=True, add_special_tokens=True)
+        ids = ids.to(self.device)
+        mask = mask.to(self.device)
+        seq_lens = mask.gt(0).sum(dim=1).long()
+        context = self.text_encoder(ids, mask)
+
+        for tensor, seq_len in zip(context, seq_lens):
+            tensor[seq_len:] = 0.0
+
+        return {
+            "prompt_embeds": context.to(device=self.output_device)
+        }
+
+
+def _load_prompt_embeds(path, key="prompt_embeds"):
+    payload = torch.load(path, map_location="cpu")
+    if torch.is_tensor(payload):
+        prompt_embeds = payload
+    elif isinstance(payload, dict):
+        if key not in payload:
+            raise KeyError(f"`{key}` not found in prompt embeds payload `{path}`.")
+        prompt_embeds = payload[key]
+    else:
+        raise TypeError(f"Unsupported prompt embeds payload type: {type(payload)!r}")
+
+    if not torch.is_tensor(prompt_embeds):
+        raise TypeError(f"`{key}` from `{path}` must be a tensor, got {type(prompt_embeds)!r}")
+
+    return prompt_embeds
+
+
+def _assert_valid_self_forcing_transformer(transformer):
+    has_cross_attn_norm = bool(getattr(transformer.config, "cross_attn_norm", False))
+    has_norm_module = transformer.blocks and not isinstance(transformer.blocks[0].norm2, torch.nn.Identity)
+
+    if has_cross_attn_norm and has_norm_module:
+        return
+
+    raise ValueError(
+        "The loaded diffusers transformer is missing Self-Forcing cross-attention norms. "
+        "Re-convert the checkpoint with `scripts/convert_wan_to_wan_diffusers.py` and use that output."
+    )
 
 
 def _make_absolute_vae_wrapper(video_vae_factory, vae_path):
@@ -271,21 +347,33 @@ def _generate_diffusers_latents(transformer, full_noise, prompt_embeds, denoisin
         state = get_rolling_kv_cache_state(transformer)
         if state is None:
             raise ValueError("Rolling KV cache must be enabled before generation.")
-        state.should_update_cache = False
         for chunk_start in range(0, full_noise.shape[1], latent_frames_per_chunk):
             frame_offset = chunk_start
             noisy_input = full_noise[:, chunk_start : chunk_start + latent_frames_per_chunk].permute(0, 2, 1, 3, 4)
             noisy_input = noisy_input.contiguous()
+            token_offset = _frame_to_token_offset(transformer, noisy_input, frame_offset)
 
             with torch.no_grad():
                 for step_index, timestep in enumerate(denoising_steps):
-                    velocity = transformer(
-                        hidden_states=noisy_input,
-                        timestep=timestep.expand(noisy_input.shape[0]),
-                        encoder_hidden_states=prompt_embeds,
-                        frame_offset=frame_offset,
-                        return_dict=False,
-                    )[0]
+                    prev_should_update = state.should_update_cache
+                    prev_write_mode = state.write_mode
+                    prev_absolute_token_offset = state.absolute_token_offset
+                    try:
+                        state.should_update_cache = True
+                        state.configure_cache_write(write_mode="overwrite", absolute_token_offset=token_offset)
+                        velocity = transformer(
+                            hidden_states=noisy_input,
+                            timestep=timestep.expand(noisy_input.shape[0], noisy_input.shape[2]),
+                            encoder_hidden_states=prompt_embeds,
+                            frame_offset=frame_offset,
+                            return_dict=False,
+                        )[0]
+                    finally:
+                        state.should_update_cache = prev_should_update
+                        state.configure_cache_write(
+                            write_mode=prev_write_mode,
+                            absolute_token_offset=prev_absolute_token_offset,
+                        )
 
                     sigma = (timestep / 1000.0).to(device=noisy_input.device, dtype=torch.float32)
                     x0_pred = (noisy_input.float() - sigma * velocity.float()).to(dtype=noisy_input.dtype)
@@ -305,6 +393,7 @@ def _generate_diffusers_latents(transformer, full_noise, prompt_embeds, denoisin
                 prompt_embeds,
                 frame_offset=frame_offset,
                 cache_context="cond",
+                write_mode="overwrite",
             )
             outputs.append(x0_pred.permute(0, 2, 1, 3, 4).contiguous())
 
@@ -317,8 +406,11 @@ def main():
     parser.add_argument("--upstream_repo_path", type=str, required=True)
     parser.add_argument("--checkpoint_path", type=str, required=True)
     parser.add_argument("--diffusers_model_path", type=str, required=True)
-    parser.add_argument("--text_encoder_path", type=str, required=True)
-    parser.add_argument("--tokenizer_path", type=str, required=True)
+    parser.add_argument("--text_encoder_source", type=str, choices=("upstream", "hf"), default="upstream")
+    parser.add_argument("--text_encoder_path", type=str, default=None)
+    parser.add_argument("--tokenizer_path", type=str, default=None)
+    parser.add_argument("--prompt_embeds_path", type=str, default=None)
+    parser.add_argument("--prompt_embeds_key", type=str, default="prompt_embeds")
     parser.add_argument("--wan_model_config", type=str, required=True)
     parser.add_argument("--vae_path", type=str, required=True)
     parser.add_argument("--prompt", type=str, required=True)
@@ -336,20 +428,40 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     upstream_modules = _load_upstream_modules(args.upstream_repo_path)
-    text_encoder = HFTextEncoder(
-        tokenizer_cls=upstream_modules["HuggingfaceTokenizer"],
-        tokenizer_path=args.tokenizer_path,
-        text_encoder_path=args.text_encoder_path,
-        device=args.text_encoder_device,
-        output_device=args.device,
-    )
-    with torch.no_grad():
-        conditional_dict = text_encoder([args.prompt])
-    prompt_embeds = conditional_dict["prompt_embeds"]
-    del text_encoder
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if args.prompt_embeds_path is not None:
+        prompt_embeds = _load_prompt_embeds(args.prompt_embeds_path, key=args.prompt_embeds_key).to(
+            device=_resolve_device(args.device)
+        )
+        conditional_dict = {"prompt_embeds": prompt_embeds}
+    else:
+        if args.text_encoder_source == "upstream":
+            text_encoder = UpstreamTextEncoder(
+                tokenizer_cls=upstream_modules["HuggingfaceTokenizer"],
+                text_encoder_factory=upstream_modules["umt5_xxl"],
+                upstream_repo_path=args.upstream_repo_path,
+                device=args.text_encoder_device,
+                output_device=args.device,
+            )
+        else:
+            if args.text_encoder_path is None or args.tokenizer_path is None:
+                raise ValueError(
+                    "`--text_encoder_path` and `--tokenizer_path` are required when `--text_encoder_source=hf` "
+                    "unless `--prompt_embeds_path` is provided."
+                )
+            text_encoder = HFTextEncoder(
+                tokenizer_cls=upstream_modules["HuggingfaceTokenizer"],
+                tokenizer_path=args.tokenizer_path,
+                text_encoder_path=args.text_encoder_path,
+                device=args.text_encoder_device,
+                output_device=args.device,
+            )
+        with torch.no_grad():
+            conditional_dict = text_encoder([args.prompt])
+        prompt_embeds = conditional_dict["prompt_embeds"]
+        del text_encoder
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     AbsoluteWanVAEWrapper = _make_absolute_vae_wrapper(upstream_modules["_video_vae"], args.vae_path)
     ConfigInitWanDiffusionWrapper = _make_config_init_wrapper(
@@ -422,6 +534,7 @@ def main():
     transformer = WanTransformer3DModel.from_pretrained(args.diffusers_model_path, torch_dtype=torch.bfloat16)
     transformer.to(args.device)
     transformer.eval()
+    _assert_valid_self_forcing_transformer(transformer)
     transformer.enable_cache(RollingKVCacheConfig(window_size=-1, cache_cross_attention=True))
 
     _manual_seed_all(renoise_seed)

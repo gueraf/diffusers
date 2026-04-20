@@ -532,7 +532,8 @@ def prefill_rolling_kv_cache(
                 cache_state.configure_cache_write(write_mode=write_mode, absolute_token_offset=token_offset)
 
                 if timestep is None:
-                    chunk_timestep = torch.zeros(chunk.shape[0], device=chunk.device, dtype=torch.long)
+                    patch_frames = chunk.shape[2] // transformer.config.patch_size[0]
+                    chunk_timestep = torch.zeros((chunk.shape[0], patch_frames), device=chunk.device, dtype=torch.long)
                 elif timestep.ndim == 0:
                     chunk_timestep = timestep.to(device=chunk.device).expand(chunk.shape[0])
                 else:

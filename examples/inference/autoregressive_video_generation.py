@@ -35,9 +35,10 @@ from diffusers.utils import export_to_video, load_video
 
 
 def _build_sf_denoising_steps(device):
-    sched = FlowMatchEulerDiscreteScheduler(shift=5.0, num_train_timesteps=1000)
-    sched.set_timesteps(1000, device="cpu")
-    all_timesteps = torch.cat([sched.timesteps.cpu(), torch.tensor([0.0])])
+    # Match guandeh17/Self-Forcing's custom FlowMatchScheduler exactly.
+    sigmas = torch.linspace(1.0, 0.0, 1001)[:-1]
+    sigmas = 5.0 * sigmas / (1.0 + 4.0 * sigmas)
+    all_timesteps = torch.cat([sigmas * 1000.0, torch.tensor([0.0])])
     original_schedule = torch.tensor([1000, 750, 500, 250])
     return all_timesteps[1000 - original_schedule].to(device)
 
@@ -83,8 +84,29 @@ def _compute_psnr(reference_frames, candidate_frames):
     return 20.0 * np.log10(255.0) - 10.0 * np.log10(mse)
 
 
+def _frame_to_token_offset(transformer, latents, frame_offset):
+    _, _, _, height, width = latents.shape
+    _, p_h, p_w = transformer.config.patch_size
+    patches_per_frame = (height // p_h) * (width // p_w)
+    return frame_offset * patches_per_frame
+
+
+def _assert_valid_self_forcing_transformer(transformer):
+    has_cross_attn_norm = bool(getattr(transformer.config, "cross_attn_norm", False))
+    has_norm_module = transformer.blocks and not isinstance(transformer.blocks[0].norm2, torch.nn.Identity)
+
+    if has_cross_attn_norm and has_norm_module:
+        return
+
+    raise ValueError(
+        "The loaded transformer is missing Self-Forcing cross-attention norms. "
+        "Re-convert the checkpoint with `scripts/convert_wan_to_wan_diffusers.py` before running autoregressive generation."
+    )
+
+
 def _load_pipeline(model_id, wan_base_model_id, device, text_encoder_device=None, vae_device=None):
     transformer = WanTransformer3DModel.from_pretrained(model_id, torch_dtype=torch.bfloat16)
+    _assert_valid_self_forcing_transformer(transformer)
     vae = AutoencoderKLWan.from_pretrained(wan_base_model_id, subfolder="vae", torch_dtype=torch.float32)
     vae_device = vae_device or device
 
@@ -143,12 +165,6 @@ def _encode_reference_chunk(pipe, frames, height, width, latents_mean, latents_s
     )
 
 
-def _set_cache_update_mode(transformer, should_update_cache, contexts):
-    for context_name in contexts:
-        with transformer.cache_context(context_name):
-            get_rolling_kv_cache_state(transformer).should_update_cache = should_update_cache
-
-
 def _generate_chunk_velocity(
     pipe,
     noisy_input,
@@ -158,33 +174,42 @@ def _generate_chunk_velocity(
     guidance_scale,
     frame_offset,
 ):
+    if timestep.ndim == 0:
+        timestep = timestep.expand(noisy_input.shape[0], noisy_input.shape[2])
+    elif timestep.ndim == 1:
+        timestep = timestep.unsqueeze(1).expand(noisy_input.shape[0], noisy_input.shape[2])
+
+    token_offset = _frame_to_token_offset(pipe.transformer, noisy_input, frame_offset)
+
+    def run_with_overwrite(cache_context, encoder_hidden_states):
+        with pipe.transformer.cache_context(cache_context):
+            cache_state = get_rolling_kv_cache_state(pipe.transformer)
+            prev_should_update = cache_state.should_update_cache
+            prev_write_mode = cache_state.write_mode
+            prev_absolute_token_offset = cache_state.absolute_token_offset
+            try:
+                cache_state.should_update_cache = True
+                cache_state.configure_cache_write(write_mode="overwrite", absolute_token_offset=token_offset)
+                return pipe.transformer(
+                    noisy_input,
+                    timestep=timestep,
+                    encoder_hidden_states=encoder_hidden_states,
+                    frame_offset=frame_offset,
+                    return_dict=False,
+                )[0]
+            finally:
+                cache_state.should_update_cache = prev_should_update
+                cache_state.configure_cache_write(
+                    write_mode=prev_write_mode,
+                    absolute_token_offset=prev_absolute_token_offset,
+                )
+
     if guidance_scale > 1.0:
-        with pipe.transformer.cache_context("cond"):
-            velocity_cond = pipe.transformer(
-                noisy_input,
-                timestep=timestep,
-                encoder_hidden_states=prompt_embeds,
-                frame_offset=frame_offset,
-                return_dict=False,
-            )[0]
-        with pipe.transformer.cache_context("uncond"):
-            velocity_uncond = pipe.transformer(
-                noisy_input,
-                timestep=timestep,
-                encoder_hidden_states=negative_prompt_embeds,
-                frame_offset=frame_offset,
-                return_dict=False,
-            )[0]
+        velocity_cond = run_with_overwrite("cond", prompt_embeds)
+        velocity_uncond = run_with_overwrite("uncond", negative_prompt_embeds)
         return velocity_uncond + guidance_scale * (velocity_cond - velocity_uncond)
 
-    with pipe.transformer.cache_context("cond"):
-        return pipe.transformer(
-            noisy_input,
-            timestep=timestep,
-            encoder_hidden_states=prompt_embeds,
-            frame_offset=frame_offset,
-            return_dict=False,
-        )[0]
+    return run_with_overwrite("cond", prompt_embeds)
 
 
 def _sample_self_forcing_renoise(latents, *, generator=None):
@@ -229,7 +254,6 @@ def generate_autoregressive_video(
 
     denoising_steps = _build_sf_denoising_steps(device=device)
     do_cfg = guidance_scale > 1.0
-    cache_contexts = ["cond", "uncond"] if do_cfg else ["cond"]
     prompt_dtype = torch.float32 if prompt_device == "cpu" else torch.bfloat16
 
     with torch.no_grad():
@@ -318,14 +342,13 @@ def generate_autoregressive_video(
             dtype=torch.bfloat16,
         )
 
-        _set_cache_update_mode(pipe.transformer, should_update_cache=False, contexts=cache_contexts)
         with torch.no_grad():
             for step_idx, timestep in enumerate(denoising_steps):
                 sigma = timestep / 1000.0
                 velocity = _generate_chunk_velocity(
                     pipe,
                     noisy_input,
-                    timestep=timestep.expand(noisy_input.shape[0]),
+                    timestep=timestep,
                     prompt_embeds=prompt_embeds,
                     negative_prompt_embeds=negative_prompt_embeds,
                     guidance_scale=guidance_scale,
@@ -344,6 +367,7 @@ def generate_autoregressive_video(
             prompt_embeds,
             frame_offset=frame_offset,
             cache_context="cond",
+            write_mode="overwrite",
         )
         if do_cfg:
             prefill_rolling_kv_cache(
@@ -352,6 +376,7 @@ def generate_autoregressive_video(
                 negative_prompt_embeds,
                 frame_offset=frame_offset,
                 cache_context="uncond",
+                write_mode="overwrite",
             )
 
         all_frames.extend(_decode_latent_chunk(pipe, x0_pred, latents_mean, latents_std))
