@@ -105,15 +105,9 @@ class RollingKVCacheCrossAttnBlockState(BaseState):
 
 
 def _apply_wan_rotary_emb(hidden_states: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor):
-    hidden_states_fp64 = hidden_states.to(torch.float64)
-    freqs_cos_fp64 = freqs_cos.to(torch.float64)
-    freqs_sin_fp64 = freqs_sin.to(torch.float64)
-    x1, x2 = hidden_states_fp64.unflatten(-1, (-1, 2)).unbind(-1)
-    cos = freqs_cos_fp64[..., 0::2]
-    sin = freqs_sin_fp64[..., 1::2]
-    out = torch.empty_like(hidden_states_fp64)
-    out[..., 0::2] = x1 * cos - x2 * sin
-    out[..., 1::2] = x1 * sin + x2 * cos
+    hidden_states_complex = torch.view_as_complex(hidden_states.to(torch.float64).reshape(*hidden_states.shape[:-1], -1, 2))
+    freqs_complex = torch.complex(freqs_cos[..., 0::2].to(torch.float64), freqs_sin[..., 0::2].to(torch.float64))
+    out = torch.view_as_real(hidden_states_complex * freqs_complex).flatten(-2)
     return out.type_as(hidden_states)
 
 

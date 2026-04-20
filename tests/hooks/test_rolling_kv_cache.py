@@ -179,6 +179,20 @@ class TestApplyWanRotaryEmb(unittest.TestCase):
         out = _apply_wan_rotary_emb(x, freqs_cos, freqs_sin)
         self.assertEqual(out.dtype, x.dtype)
 
+    def test_matches_complex_reference(self):
+        x = torch.randn(1, 4, 2, 16, dtype=torch.bfloat16)
+        freqs_cos = torch.randn(1, 4, 1, 16, dtype=torch.float32)
+        freqs_sin = torch.randn(1, 4, 1, 16, dtype=torch.float32)
+
+        expected = torch.view_as_real(
+            torch.view_as_complex(x.to(torch.float64).reshape(*x.shape[:-1], -1, 2))
+            * torch.complex(freqs_cos[..., 0::2].to(torch.float64), freqs_sin[..., 0::2].to(torch.float64))
+        ).flatten(-2).to(x.dtype)
+
+        out = _apply_wan_rotary_emb(x, freqs_cos, freqs_sin)
+
+        torch.testing.assert_close(out, expected)
+
 
 class TestApplyRollingKVCache(unittest.TestCase):
     def setUp(self):

@@ -104,9 +104,26 @@ def _assert_valid_self_forcing_transformer(transformer):
     )
 
 
+def _align_self_forcing_transformer_dtype(transformer):
+    runtime_device = transformer.patch_embedding.weight.device
+    runtime_dtype = transformer.patch_embedding.weight.dtype
+
+    transformer.condition_embedder.time_embedder.to(device=runtime_device, dtype=runtime_dtype)
+    transformer.scale_shift_table.data = transformer.scale_shift_table.data.to(device=runtime_device, dtype=runtime_dtype)
+
+    for block in transformer.blocks:
+        block.scale_shift_table.data = block.scale_shift_table.data.to(device=runtime_device, dtype=runtime_dtype)
+
+        if hasattr(block.norm2, "weight") and block.norm2.weight is not None:
+            block.norm2.weight.data = block.norm2.weight.data.to(device=runtime_device, dtype=runtime_dtype)
+        if hasattr(block.norm2, "bias") and block.norm2.bias is not None:
+            block.norm2.bias.data = block.norm2.bias.data.to(device=runtime_device, dtype=runtime_dtype)
+
+
 def _load_pipeline(model_id, wan_base_model_id, device, text_encoder_device=None, vae_device=None):
     transformer = WanTransformer3DModel.from_pretrained(model_id, torch_dtype=torch.bfloat16)
     _assert_valid_self_forcing_transformer(transformer)
+    _align_self_forcing_transformer_dtype(transformer)
     vae = AutoencoderKLWan.from_pretrained(wan_base_model_id, subfolder="vae", torch_dtype=torch.float32)
     vae_device = vae_device or device
 

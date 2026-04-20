@@ -19,6 +19,7 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+from torch import nn
 
 
 SCRIPT_PATH = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "validate_self_forcing_against_upstream.py"
@@ -82,6 +83,50 @@ class TestValidateSelfForcingAgainstUpstreamHelpers(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "missing Self-Forcing cross-attention norms"):
             EXAMPLE_MODULE._assert_valid_self_forcing_transformer(transformer)
+
+    def test_align_self_forcing_transformer_dtype_casts_fp32_runtime_modules(self):
+        class DummyBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scale_shift_table = nn.Parameter(torch.zeros(1, 6, 4, dtype=torch.float32))
+                self.norm2 = nn.LayerNorm(4, elementwise_affine=True)
+
+        class DummyConditionEmbedder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.time_embedder = nn.Sequential(nn.Linear(4, 4), nn.SiLU(), nn.Linear(4, 4))
+
+        class DummyTransformer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.patch_embedding = nn.Conv3d(1, 1, kernel_size=1, bias=False).to(dtype=torch.bfloat16)
+                self.condition_embedder = DummyConditionEmbedder()
+                self.scale_shift_table = nn.Parameter(torch.zeros(1, 2, 4, dtype=torch.float32))
+                self.blocks = nn.ModuleList([DummyBlock()])
+
+        transformer = DummyTransformer()
+        self.assertEqual(transformer.patch_embedding.weight.dtype, torch.bfloat16)
+        self.assertEqual(transformer.condition_embedder.time_embedder[0].weight.dtype, torch.float32)
+        self.assertEqual(transformer.scale_shift_table.dtype, torch.float32)
+        self.assertEqual(transformer.blocks[0].scale_shift_table.dtype, torch.float32)
+        self.assertEqual(transformer.blocks[0].norm2.weight.dtype, torch.float32)
+
+        MODULE._align_self_forcing_transformer_dtype(transformer)
+
+        self.assertEqual(transformer.condition_embedder.time_embedder[0].weight.dtype, torch.bfloat16)
+        self.assertEqual(transformer.condition_embedder.time_embedder[2].weight.dtype, torch.bfloat16)
+        self.assertEqual(transformer.scale_shift_table.dtype, torch.bfloat16)
+        self.assertEqual(transformer.blocks[0].scale_shift_table.dtype, torch.bfloat16)
+        self.assertEqual(transformer.blocks[0].norm2.weight.dtype, torch.bfloat16)
+        self.assertEqual(transformer.blocks[0].norm2.bias.dtype, torch.bfloat16)
+
+        transformer = DummyTransformer()
+        EXAMPLE_MODULE._align_self_forcing_transformer_dtype(transformer)
+
+        self.assertEqual(transformer.condition_embedder.time_embedder[0].weight.dtype, torch.bfloat16)
+        self.assertEqual(transformer.scale_shift_table.dtype, torch.bfloat16)
+        self.assertEqual(transformer.blocks[0].scale_shift_table.dtype, torch.bfloat16)
+        self.assertEqual(transformer.blocks[0].norm2.weight.dtype, torch.bfloat16)
 
 
 if __name__ == "__main__":
