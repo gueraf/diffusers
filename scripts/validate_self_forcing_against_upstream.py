@@ -38,12 +38,39 @@ def _manual_seed_all(seed):
 
 
 def _build_sf_denoising_steps(device):
-    # Match guandeh17/Self-Forcing's custom FlowMatchScheduler exactly.
-    sigmas = torch.linspace(1.0, 0.0, 1001)[:-1]
+    sigmas = torch.linspace(1.0, 0.0, 1001, device=device, dtype=torch.float64)[:-1]
     sigmas = 5.0 * sigmas / (1.0 + 4.0 * sigmas)
-    all_timesteps = torch.cat([sigmas * 1000.0, torch.tensor([0.0])])
-    original_schedule = torch.tensor([1000, 750, 500, 250])
-    return all_timesteps[1000 - original_schedule].to(device=device, dtype=torch.float32)
+    all_timesteps = torch.cat([sigmas * 1000.0, torch.tensor([0.0], device=device, dtype=torch.float64)])
+    original_schedule = torch.tensor([1000, 750, 500, 250], device=device, dtype=torch.long)
+    return all_timesteps[1000 - original_schedule].to(dtype=torch.float32)
+
+
+def _build_sf_scheduler_tables(device):
+    sigmas = torch.linspace(1.0, 0.0, 1001, device=device, dtype=torch.float32)[:-1]
+    sigmas = 5.0 * sigmas / (1.0 + 4.0 * sigmas)
+    timesteps = torch.cat([sigmas * 1000.0, torch.tensor([0.0], device=device, dtype=torch.float32)])
+    return timesteps, sigmas
+
+
+def _lookup_sf_sigma(timestep, scheduler_timesteps, scheduler_sigmas):
+    timestep = timestep.to(device=scheduler_timesteps.device, dtype=scheduler_timesteps.dtype)
+    flat_timestep = timestep.reshape(-1)
+    timestep_id = torch.argmin((scheduler_timesteps.unsqueeze(0) - flat_timestep.unsqueeze(1)).abs(), dim=1)
+    return scheduler_sigmas[timestep_id].reshape(timestep.shape)
+
+
+def _convert_sf_flow_to_x0(flow_pred, xt, timestep, scheduler_timesteps, scheduler_sigmas):
+    sigma = _lookup_sf_sigma(timestep, scheduler_timesteps, scheduler_sigmas).to(torch.float64)
+    sigma = sigma.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+    x0_pred = xt.to(torch.float64) - sigma * flow_pred.to(torch.float64)
+    return x0_pred.to(flow_pred.dtype)
+
+
+def _add_sf_noise(x0_pred, noise, timestep, scheduler_timesteps, scheduler_sigmas):
+    sigma = _lookup_sf_sigma(timestep, scheduler_timesteps, scheduler_sigmas)
+    sigma = sigma.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+    noisy = (1.0 - sigma) * x0_pred + sigma * noise
+    return noisy.to(noise.dtype)
 
 
 def _compute_psnr(reference_frames, candidate_frames):
@@ -357,7 +384,15 @@ def _make_config_init_wrapper(base_wrapper_cls, causal_model_cls, scheduler_cls,
     return ConfigInitWanDiffusionWrapper
 
 
-def _generate_diffusers_latents(transformer, full_noise, prompt_embeds, denoising_steps, latent_frames_per_chunk):
+def _generate_diffusers_latents(
+    transformer,
+    full_noise,
+    prompt_embeds,
+    denoising_steps,
+    scheduler_timesteps,
+    scheduler_sigmas,
+    latent_frames_per_chunk,
+):
     outputs = []
     with transformer.cache_context("cond"):
         state = get_rolling_kv_cache_state(transformer)
@@ -371,6 +406,7 @@ def _generate_diffusers_latents(transformer, full_noise, prompt_embeds, denoisin
 
             with torch.no_grad():
                 for step_index, timestep in enumerate(denoising_steps):
+                    model_timestep = timestep.expand(noisy_input.shape[0], noisy_input.shape[2])
                     prev_should_update = state.should_update_cache
                     prev_write_mode = state.write_mode
                     prev_absolute_token_offset = state.absolute_token_offset
@@ -379,7 +415,7 @@ def _generate_diffusers_latents(transformer, full_noise, prompt_embeds, denoisin
                         state.configure_cache_write(write_mode="overwrite", absolute_token_offset=token_offset)
                         velocity = transformer(
                             hidden_states=noisy_input,
-                            timestep=timestep.expand(noisy_input.shape[0], noisy_input.shape[2]),
+                            timestep=model_timestep,
                             encoder_hidden_states=prompt_embeds,
                             frame_offset=frame_offset,
                             return_dict=False,
@@ -391,16 +427,25 @@ def _generate_diffusers_latents(transformer, full_noise, prompt_embeds, denoisin
                             absolute_token_offset=prev_absolute_token_offset,
                         )
 
-                    sigma = (timestep / 1000.0).to(device=noisy_input.device, dtype=torch.float32)
-                    x0_pred = (noisy_input.float() - sigma * velocity.float()).to(dtype=noisy_input.dtype)
+                    x0_pred = _convert_sf_flow_to_x0(
+                        velocity,
+                        noisy_input,
+                        model_timestep,
+                        scheduler_timesteps,
+                        scheduler_sigmas,
+                    )
 
                     if step_index < len(denoising_steps) - 1:
-                        next_sigma = (denoising_steps[step_index + 1] / 1000.0).to(
-                            device=noisy_input.device, dtype=torch.float32
+                        next_timestep = denoising_steps[step_index + 1].expand(
+                            noisy_input.shape[0], noisy_input.shape[2]
                         )
                         eps = _sample_self_forcing_renoise(x0_pred)
-                        noisy_input = ((1.0 - next_sigma) * x0_pred + next_sigma * eps).to(
-                            dtype=noisy_input.dtype
+                        noisy_input = _add_sf_noise(
+                            x0_pred,
+                            eps,
+                            next_timestep,
+                            scheduler_timesteps,
+                            scheduler_sigmas,
                         )
 
             prefill_rolling_kv_cache(
@@ -556,11 +601,14 @@ def main():
 
     _manual_seed_all(renoise_seed)
     denoising_steps = _build_sf_denoising_steps(device=_resolve_device(args.device))
+    scheduler_timesteps, scheduler_sigmas = _build_sf_scheduler_tables(device=_resolve_device(args.device))
     diffusers_latents = _generate_diffusers_latents(
         transformer=transformer,
         full_noise=full_noise.clone(),
         prompt_embeds=prompt_embeds,
         denoising_steps=denoising_steps,
+        scheduler_timesteps=scheduler_timesteps,
+        scheduler_sigmas=scheduler_sigmas,
         latent_frames_per_chunk=latent_frames_per_chunk,
     )
     del transformer

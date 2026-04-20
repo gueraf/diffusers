@@ -30,7 +30,7 @@ from diffusers.hooks.rolling_kv_cache import (
     _ROLLING_KV_CACHE_SELF_ATTN_HOOK,
     _apply_wan_rotary_emb,
 )
-from diffusers.models.transformers.transformer_wan import WanTransformerBlock
+from diffusers.models.transformers.transformer_wan import WanRotaryPosEmbed, WanTransformerBlock
 
 
 WAN_TINY_CONFIG = {
@@ -192,6 +192,38 @@ class TestApplyWanRotaryEmb(unittest.TestCase):
         out = _apply_wan_rotary_emb(x, freqs_cos, freqs_sin)
 
         torch.testing.assert_close(out, expected)
+
+    def test_wan_rotary_pos_embed_matches_exact_complex_layout(self):
+        rotary = WanRotaryPosEmbed(attention_head_dim=16, patch_size=(1, 2, 2), max_seq_len=32)
+        hidden_states = torch.randn(1, 16, 2, 4, 6)
+
+        freqs_cos, freqs_sin = rotary(hidden_states, frame_offset=3)
+        freqs_complex = torch.complex(freqs_cos[..., 0::2].to(torch.float64), freqs_sin[..., 0::2].to(torch.float64))
+
+        f = hidden_states.shape[2] // rotary.patch_size[0]
+        h = hidden_states.shape[3] // rotary.patch_size[1]
+        w = hidden_states.shape[4] // rotary.patch_size[2]
+        t_complex_dim = rotary.t_dim // 2
+        h_complex_dim = rotary.h_dim // 2
+        w_complex_dim = rotary.w_dim // 2
+
+        def wan_rope_params(dim):
+            freqs = torch.outer(
+                torch.arange(rotary.max_seq_len, dtype=torch.float64),
+                1.0 / torch.pow(torch.tensor(10000.0, dtype=torch.float64), torch.arange(0, dim, 2, dtype=torch.float64).div(dim)),
+            )
+            return torch.polar(torch.ones_like(freqs), freqs)
+
+        expected = torch.cat(
+            [
+                wan_rope_params(rotary.t_dim)[3 : 3 + f].view(f, 1, 1, t_complex_dim).expand(f, h, w, t_complex_dim),
+                wan_rope_params(rotary.h_dim)[:h].view(1, h, 1, h_complex_dim).expand(f, h, w, h_complex_dim),
+                wan_rope_params(rotary.w_dim)[:w].view(1, 1, w, w_complex_dim).expand(f, h, w, w_complex_dim),
+            ],
+            dim=-1,
+        ).reshape(1, f * h * w, 1, -1)
+
+        torch.testing.assert_close(freqs_complex, expected)
 
 
 class TestApplyRollingKVCache(unittest.TestCase):
@@ -370,6 +402,27 @@ class TestApplyRollingKVCache(unittest.TestCase):
         self.assertEqual(implicit_state.cache_start_token_offset, explicit_state.cache_start_token_offset)
         torch.testing.assert_close(implicit_state.cached_key, explicit_state.cached_key)
         torch.testing.assert_close(implicit_state.cached_value, explicit_state.cached_value)
+
+    def test_cache_context_restores_outer_context_after_nested_scope(self):
+        block = _get_blocks(self.transformer)[0]
+        hook = block.attn1._diffusers_hook.get_hook(_ROLLING_KV_CACHE_SELF_ATTN_HOOK)
+
+        self.assertIsNone(hook.state_manager._current_context)
+        self.assertIsNone(hook.block_state_manager._current_context)
+
+        with self.transformer.cache_context("cond"):
+            self.assertEqual(hook.state_manager._current_context, "cond")
+            self.assertEqual(hook.block_state_manager._current_context, "cond")
+
+            with self.transformer.cache_context("uncond"):
+                self.assertEqual(hook.state_manager._current_context, "uncond")
+                self.assertEqual(hook.block_state_manager._current_context, "uncond")
+
+            self.assertEqual(hook.state_manager._current_context, "cond")
+            self.assertEqual(hook.block_state_manager._current_context, "cond")
+
+        self.assertIsNone(hook.state_manager._current_context)
+        self.assertIsNone(hook.block_state_manager._current_context)
 
     def test_reset_stateful_hooks_clears_cache(self):
         hidden_states, timestep, encoder_hidden_states = _make_inputs()

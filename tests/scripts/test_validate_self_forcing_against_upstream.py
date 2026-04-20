@@ -50,6 +50,31 @@ class TestValidateSelfForcingAgainstUpstreamHelpers(unittest.TestCase):
 
         self.assertTrue(torch.allclose(steps.cpu(), expected))
 
+    def test_scheduler_sigma_lookup_matches_upstream_shifted_sigmas(self):
+        expected = torch.tensor([1.0, 0.9375, 0.8333333333333334, 0.6250], dtype=torch.float32)
+        timesteps = torch.tensor([1000.0, 937.5, 833.3333129882812, 625.0], dtype=torch.float32)
+
+        module_timesteps, module_sigmas = MODULE._build_sf_scheduler_tables(torch.device("cpu"))
+        example_timesteps, example_sigmas = EXAMPLE_MODULE._build_sf_scheduler_tables(torch.device("cpu"))
+
+        torch.testing.assert_close(MODULE._lookup_sf_sigma(timesteps, module_timesteps, module_sigmas), expected)
+        torch.testing.assert_close(EXAMPLE_MODULE._lookup_sf_sigma(timesteps, example_timesteps, example_sigmas), expected)
+
+    def test_convert_sf_flow_to_x0_uses_scheduler_sigma_lookup(self):
+        flow_pred = torch.ones(1, 2, 3, 1, 1, dtype=torch.bfloat16)
+        xt = torch.zeros_like(flow_pred)
+        timestep = torch.full((1, 3), 937.5, dtype=torch.float32)
+
+        module_timesteps, module_sigmas = MODULE._build_sf_scheduler_tables(torch.device("cpu"))
+        example_timesteps, example_sigmas = EXAMPLE_MODULE._build_sf_scheduler_tables(torch.device("cpu"))
+        expected = torch.full_like(flow_pred, -0.9375)
+
+        module_x0 = MODULE._convert_sf_flow_to_x0(flow_pred, xt, timestep, module_timesteps, module_sigmas)
+        example_x0 = EXAMPLE_MODULE._convert_sf_flow_to_x0(flow_pred, xt, timestep, example_timesteps, example_sigmas)
+
+        torch.testing.assert_close(module_x0.float(), expected.float())
+        torch.testing.assert_close(example_x0.float(), expected.float())
+
     def test_load_prompt_embeds_from_tensor_payload(self):
         expected = torch.randn(1, 4, 8)
 

@@ -166,8 +166,10 @@ class CacheMixin:
         from ..hooks import HookRegistry
 
         registry = HookRegistry.check_if_exists_or_initialize(self)
+        previous_context = registry._get_context()
         registry._set_context(name)
 
-        yield
-
-        registry._set_context(None)
+        try:
+            yield
+        finally:
+            registry._set_context(previous_context)

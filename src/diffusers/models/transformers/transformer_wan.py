@@ -27,7 +27,7 @@ from .._modeling_parallel import ContextParallelInput, ContextParallelOutput
 from ..attention import AttentionMixin, AttentionModuleMixin, FeedForward
 from ..attention_dispatch import dispatch_attention_fn
 from ..cache_utils import CacheMixin
-from ..embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps, get_1d_rotary_pos_embed
+from ..embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from ..modeling_outputs import Transformer2DModelOutput
 from ..modeling_utils import ModelMixin
 from ..normalization import FP32LayerNorm, RMSNorm
@@ -383,45 +383,42 @@ class WanRotaryPosEmbed(nn.Module):
         self.w_dim = w_dim
 
         freqs_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+        complex_dtype = torch.complex64 if freqs_dtype == torch.float32 else torch.complex128
 
-        freqs_cos = []
-        freqs_sin = []
+        def _wan_rope_params(dim: int) -> torch.Tensor:
+            if dim % 2 != 0:
+                raise ValueError(f"`dim` must be even for Wan rotary embeddings, but received {dim}.")
 
-        for dim in [t_dim, h_dim, w_dim]:
-            freq_cos, freq_sin = get_1d_rotary_pos_embed(
-                dim,
-                max_seq_len,
-                theta,
-                use_real=True,
-                repeat_interleave_real=True,
-                freqs_dtype=freqs_dtype,
+            freqs = torch.outer(
+                torch.arange(max_seq_len, dtype=freqs_dtype),
+                1.0
+                / torch.pow(
+                    torch.tensor(theta, dtype=freqs_dtype),
+                    torch.arange(0, dim, 2, dtype=freqs_dtype).div(dim),
+                ),
             )
-            freqs_cos.append(freq_cos)
-            freqs_sin.append(freq_sin)
+            return torch.polar(torch.ones_like(freqs), freqs).to(complex_dtype)
 
-        self.register_buffer("freqs_cos", torch.cat(freqs_cos, dim=1), persistent=False)
-        self.register_buffer("freqs_sin", torch.cat(freqs_sin, dim=1), persistent=False)
+        self.register_buffer("freqs_t_complex", _wan_rope_params(t_dim), persistent=False)
+        self.register_buffer("freqs_h_complex", _wan_rope_params(h_dim), persistent=False)
+        self.register_buffer("freqs_w_complex", _wan_rope_params(w_dim), persistent=False)
 
     def forward(self, hidden_states: torch.Tensor, frame_offset: int = 0) -> torch.Tensor:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.patch_size
         ppf, pph, ppw = num_frames // p_t, height // p_h, width // p_w
 
-        split_sizes = [self.t_dim, self.h_dim, self.w_dim]
+        freqs_complex_f = self.freqs_t_complex[frame_offset : frame_offset + ppf].view(ppf, 1, 1, -1).expand(
+            ppf, pph, ppw, -1
+        )
+        freqs_complex_h = self.freqs_h_complex[:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_complex_w = self.freqs_w_complex[:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
 
-        freqs_cos = self.freqs_cos.split(split_sizes, dim=1)
-        freqs_sin = self.freqs_sin.split(split_sizes, dim=1)
-
-        freqs_cos_f = freqs_cos[0][frame_offset : frame_offset + ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
-        freqs_cos_h = freqs_cos[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
-        freqs_cos_w = freqs_cos[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
-
-        freqs_sin_f = freqs_sin[0][frame_offset : frame_offset + ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
-        freqs_sin_h = freqs_sin[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
-        freqs_sin_w = freqs_sin[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
-
-        freqs_cos = torch.cat([freqs_cos_f, freqs_cos_h, freqs_cos_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
-        freqs_sin = torch.cat([freqs_sin_f, freqs_sin_h, freqs_sin_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
+        freqs_complex = torch.cat([freqs_complex_f, freqs_complex_h, freqs_complex_w], dim=-1).reshape(
+            1, ppf * pph * ppw, 1, -1
+        )
+        freqs_cos = freqs_complex.real.repeat_interleave(2, dim=-1)
+        freqs_sin = freqs_complex.imag.repeat_interleave(2, dim=-1)
 
         return freqs_cos, freqs_sin
 
