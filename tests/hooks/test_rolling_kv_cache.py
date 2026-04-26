@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import unittest
 
 import torch
@@ -23,73 +24,79 @@ from diffusers.hooks.rolling_kv_cache import (
     RollingKVCacheBlockState,
     RollingKVCacheState,
 )
-from diffusers.models.transformers.transformer_wan import WanTransformerBlock
+from diffusers.models.cache_utils import CacheMixin
 
 
 _DEVICE = torch.device("cpu")
-
-WAN_TINY_CONFIG = {
-    "patch_size": [1, 2, 2],
-    "num_attention_heads": 2,
-    "attention_head_dim": 16,
-    "in_channels": 16,
-    "out_channels": 16,
-    "text_dim": 32,
-    "freq_dim": 32,
-    "ffn_dim": 64,
-    "num_layers": 2,
-    "cross_attn_norm": False,
-    "qk_norm": "rms_norm_across_heads",
-    "eps": 1e-6,
-    "image_dim": None,
-    "added_kv_proj_dim": None,
-    "rope_max_seq_len": 32,
-}
-
-_BATCH = 1
-_T, _H, _W = 1, 4, 4
-_IN_CHANNELS = 16
-_TEXT_SEQ_LEN = 10
-_TEXT_DIM = 32
-_TOKENS_PER_CHUNK = (_T // WAN_TINY_CONFIG["patch_size"][0]) * (_H // 2) * (_W // 2)
+_HEAD_DIM = 4
 
 
-def _make_transformer(config=None):
-    from diffusers import WanTransformer3DModel
-
-    torch.manual_seed(0)
-    return WanTransformer3DModel.from_config(config or WAN_TINY_CONFIG).to(_DEVICE)
+# ---------- Fake self-attention so cache contents read out as input tokens ----------
 
 
-def _make_inputs(batch=_BATCH, t=_T, h=_H, w=_W, text_seq=_TEXT_SEQ_LEN, text_dim=_TEXT_DIM):
-    hidden_states = torch.randn(batch, _IN_CHANNELS, t, h, w, device=_DEVICE)
-    timestep = torch.zeros(batch, dtype=torch.long, device=_DEVICE)
-    encoder_hidden_states = torch.randn(batch, text_seq, text_dim, device=_DEVICE)
-    return hidden_states, timestep, encoder_hidden_states
+class _IdentitySelfAttention(torch.nn.Module):
+    """Self-attention stub with identity Q/K/V/norm/out projections.
+
+    Because every projection is identity, whatever scalar token value goes in comes back out
+    inside `cached_key` / `cached_value`. That makes the cache directly inspectable in tests.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.heads = 1
+        self.is_cross_attention = False
+        self.to_q = torch.nn.Identity()
+        self.to_k = torch.nn.Identity()
+        self.to_v = torch.nn.Identity()
+        self.norm_q = torch.nn.Identity()
+        self.norm_k = torch.nn.Identity()
+        self.to_out = torch.nn.ModuleList([torch.nn.Identity(), torch.nn.Identity()])
 
 
-def _get_blocks(transformer):
-    return [module for module in transformer.modules() if isinstance(module, WanTransformerBlock)]
+class _FakeTransformer(torch.nn.Module, CacheMixin):
+    """Tiny CacheMixin wrapper so `cache_context(...)` works in the tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.attn = _IdentitySelfAttention()
+
+    def forward(self, hidden_states):
+        return self.attn(hidden_states)
 
 
-def _get_hook(transformer, block_idx=0):
-    hook = _get_blocks(transformer)[block_idx].attn1._diffusers_hook.get_hook(_ROLLING_KV_CACHE_HOOK)
+def _make_transformer(window_size: int = -1) -> _FakeTransformer:
+    transformer = _FakeTransformer().to(_DEVICE).eval()
+    # Silence the "untested attention class" warning the hook emits for non-Wan modules —
+    # exercising that warning is covered by `test_warns_when_attaching_to_untested_class`.
+    logging.getLogger("diffusers.hooks.rolling_kv_cache").setLevel(logging.ERROR)
+    apply_rolling_kv_cache(transformer, RollingKVCacheConfig(window_size=window_size))
+    logging.getLogger("diffusers.hooks.rolling_kv_cache").setLevel(logging.WARNING)
+    return transformer
+
+
+def _ramp(values) -> torch.Tensor:
+    """Build (1, len(values), HEAD_DIM) where token i has every entry equal to values[i]."""
+    return (
+        torch.tensor(values, dtype=torch.float32, device=_DEVICE)
+        .reshape(1, -1, 1)
+        .expand(1, -1, _HEAD_DIM)
+        .contiguous()
+    )
+
+
+def _cached_token_values(cached: torch.Tensor) -> list[float]:
+    """Read scalar token values from a (B, S, H, D) cache tensor along S."""
+    return cached[0, :, 0, 0].tolist()
+
+
+def _block_state(transformer: _FakeTransformer) -> RollingKVCacheBlockState:
+    hook = transformer.attn._diffusers_hook.get_hook(_ROLLING_KV_CACHE_HOOK)
     if hook.block_state_manager._current_context is None:
         hook.block_state_manager.set_context("inference")
-    return hook
+    return hook.block_state_manager.get_state()
 
 
-def _get_block_state(transformer, block_idx=0):
-    return _get_hook(transformer, block_idx).block_state_manager.get_state()
-
-
-def _run_chunk(transformer, hidden_states, timestep, encoder_hidden_states):
-    with torch.no_grad():
-        return transformer(
-            hidden_states,
-            timestep=timestep,
-            encoder_hidden_states=encoder_hidden_states,
-        ).sample
+# ---------- State-class unit tests ----------
 
 
 class TestStateClasses(unittest.TestCase):
@@ -109,24 +116,25 @@ class TestStateClasses(unittest.TestCase):
         self.assertIsNone(state.absolute_token_offset)
 
     def test_configure_cache_write_rejects_offset_in_append_mode(self):
-        state = RollingKVCacheState()
         with self.assertRaises(ValueError):
-            state.configure_cache_write(write_mode="append", absolute_token_offset=4)
+            RollingKVCacheState().configure_cache_write(write_mode="append", absolute_token_offset=4)
 
     def test_configure_cache_write_requires_offset_in_overwrite_mode(self):
-        state = RollingKVCacheState()
         with self.assertRaises(ValueError):
-            state.configure_cache_write(write_mode="overwrite")
+            RollingKVCacheState().configure_cache_write(write_mode="overwrite")
 
     def test_block_state_reset(self):
         state = RollingKVCacheBlockState()
-        state.cached_key = torch.randn(1, 4, 2, 16)
-        state.cached_value = torch.randn(1, 4, 2, 16)
+        state.cached_key = torch.randn(1, 4, 2, _HEAD_DIM)
+        state.cached_value = torch.randn(1, 4, 2, _HEAD_DIM)
         state.cache_start_token_offset = 16
         state.reset()
         self.assertIsNone(state.cached_key)
         self.assertIsNone(state.cached_value)
         self.assertEqual(state.cache_start_token_offset, 0)
+
+
+# ---------- Rotary helper unit tests ----------
 
 
 class TestRotaryEmb(unittest.TestCase):
@@ -160,131 +168,209 @@ class TestRotaryEmb(unittest.TestCase):
         torch.testing.assert_close(out, expected)
 
 
-class TestApplyRollingKVCache(unittest.TestCase):
-    def setUp(self):
-        self.transformer = _make_transformer()
-        self.transformer.eval()
-        apply_rolling_kv_cache(self.transformer, RollingKVCacheConfig(window_size=-1))
+# ---------- Cache mechanics, expressed as token values ----------
+
+
+class TestRollingKVCacheMechanics(unittest.TestCase):
+    def test_first_pass_caches_input_tokens_verbatim(self):
+        transformer = _make_transformer()
+
+        with torch.no_grad():
+            transformer(_ramp([0, 1, 2]))
+
+        state = _block_state(transformer)
+        self.assertEqual(_cached_token_values(state.cached_key), [0.0, 1.0, 2.0])
+        self.assertEqual(_cached_token_values(state.cached_value), [0.0, 1.0, 2.0])
+        self.assertEqual(state.cache_start_token_offset, 0)
+
+    def test_second_pass_appends_to_existing_cache(self):
+        transformer = _make_transformer()
+
+        with torch.no_grad():
+            transformer(_ramp([0, 1, 2]))
+            transformer(_ramp([3, 4, 5]))
+
+        state = _block_state(transformer)
+        self.assertEqual(_cached_token_values(state.cached_key), [0.0, 1.0, 2.0, 3.0, 4.0, 5.0])
+        self.assertEqual(state.cache_start_token_offset, 0)
+
+    def test_window_trims_oldest_tokens_and_advances_start_offset(self):
+        transformer = _make_transformer(window_size=4)
+
+        with torch.no_grad():
+            transformer(_ramp([0, 1, 2]))
+            transformer(_ramp([3, 4, 5]))
+
+        # Cache reached length 6, window keeps the most recent 4. Start offset moves to 2 so that
+        # `cache_start_token_offset + cached_len` is still the absolute end of the stream (=6).
+        state = _block_state(transformer)
+        self.assertEqual(_cached_token_values(state.cached_key), [2.0, 3.0, 4.0, 5.0])
+        self.assertEqual(state.cache_start_token_offset, 2)
+
+    def test_should_update_cache_false_freezes_cache(self):
+        transformer = _make_transformer()
+        cache_state = get_rolling_kv_cache_state(transformer)
+
+        with torch.no_grad():
+            transformer(_ramp([0, 1, 2]))
+
+        cache_state.should_update_cache = False
+        with torch.no_grad():
+            transformer(_ramp([3, 4, 5]))
+
+        # Forward still ran — but the new chunk did NOT enter the cache.
+        state = _block_state(transformer)
+        self.assertEqual(_cached_token_values(state.cached_key), [0.0, 1.0, 2.0])
+
+    def test_overwrite_replaces_suffix_at_absolute_offset(self):
+        transformer = _make_transformer()
+        cache_state = get_rolling_kv_cache_state(transformer)
+
+        # Three chunks → cache holds tokens 0..8 at absolute positions 0..8.
+        with torch.no_grad():
+            transformer(_ramp([0, 1, 2]))
+            transformer(_ramp([3, 4, 5]))
+            transformer(_ramp([6, 7, 8]))
+
+        # Rewind to absolute offset 3 and replace the [3,4,5] + [6,7,8] suffix with new values.
+        cache_state.configure_cache_write(write_mode="overwrite", absolute_token_offset=3)
+        try:
+            with torch.no_grad():
+                transformer(_ramp([90, 91, 92]))
+        finally:
+            cache_state.clear_cache_write()
+
+        state = _block_state(transformer)
+        # Tokens at absolute 6..8 are gone; new tokens land at absolute 3..5.
+        self.assertEqual(_cached_token_values(state.cached_key), [0.0, 1.0, 2.0, 90.0, 91.0, 92.0])
+        self.assertEqual(state.cache_start_token_offset, 0)
+
+    def test_overwrite_at_cache_start_drops_entire_prefix(self):
+        transformer = _make_transformer()
+        cache_state = get_rolling_kv_cache_state(transformer)
+
+        with torch.no_grad():
+            transformer(_ramp([0, 1, 2]))
+            transformer(_ramp([3, 4, 5]))
+
+        cache_state.configure_cache_write(write_mode="overwrite", absolute_token_offset=0)
+        try:
+            with torch.no_grad():
+                transformer(_ramp([7, 8]))
+        finally:
+            cache_state.clear_cache_write()
+
+        state = _block_state(transformer)
+        self.assertEqual(_cached_token_values(state.cached_key), [7.0, 8.0])
+        self.assertEqual(state.cache_start_token_offset, 0)
+
+    def test_overwrite_past_cache_end_raises(self):
+        transformer = _make_transformer()
+        cache_state = get_rolling_kv_cache_state(transformer)
+
+        with torch.no_grad():
+            transformer(_ramp([0, 1, 2]))
+
+        # Cache covers absolute positions 0..2 (cache_end=3). Asking to overwrite at 5 leaves a hole.
+        cache_state.configure_cache_write(write_mode="overwrite", absolute_token_offset=5)
+        with self.assertRaisesRegex(ValueError, "beyond the retained cache prefix"):
+            with torch.no_grad():
+                transformer(_ramp([9, 10]))
+
+    def test_cache_context_isolates_cond_and_uncond(self):
+        transformer = _make_transformer()
+
+        with torch.no_grad(), transformer.cache_context("cond"):
+            transformer(_ramp([0, 1, 2]))
+            self.assertEqual(_cached_token_values(_block_state(transformer).cached_key), [0.0, 1.0, 2.0])
+
+        with torch.no_grad(), transformer.cache_context("uncond"):
+            transformer(_ramp([10, 20, 30]))
+            self.assertEqual(
+                _cached_token_values(_block_state(transformer).cached_key), [10.0, 20.0, 30.0]
+            )
+
+        # Re-entering "cond" sees the cond cache untouched, then appends.
+        with torch.no_grad(), transformer.cache_context("cond"):
+            transformer(_ramp([3, 4, 5]))
+            self.assertEqual(
+                _cached_token_values(_block_state(transformer).cached_key),
+                [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            )
+
+    def test_reset_stateful_hooks_clears_cache(self):
+        transformer = _make_transformer()
+
+        with torch.no_grad():
+            transformer(_ramp([0, 1, 2]))
+        self.assertIsNotNone(_block_state(transformer).cached_key)
+
+        transformer._diffusers_hook.reset_stateful_hooks()
+
+        state = _block_state(transformer)
+        self.assertIsNone(state.cached_key)
+        self.assertIsNone(state.cached_value)
+        self.assertEqual(state.cache_start_token_offset, 0)
+
+    def test_batch_size_mismatch_raises(self):
+        transformer = _make_transformer()
+
+        with torch.no_grad():
+            transformer(_ramp([0, 1, 2]))  # cached batch = 1
+
+        # New chunk with batch=2 by stacking the same ramp; cached cache was batch=1.
+        chunk = _ramp([3, 4, 5]).expand(2, -1, -1).contiguous()
+        with self.assertRaisesRegex(ValueError, "batch size mismatch"):
+            with torch.no_grad():
+                transformer(chunk)
+
+
+# ---------- Integration: real Wan attention selection + warning ----------
+
+
+class TestApplyRollingKVCacheOnWan(unittest.TestCase):
+    """One sanity check that the duck-typed self-attn detection actually picks WanAttention."""
 
     def test_hooks_attach_to_self_attention_only(self):
-        blocks = _get_blocks(self.transformer)
-        self.assertEqual(len(blocks), WAN_TINY_CONFIG["num_layers"])
+        from diffusers import WanTransformer3DModel
+        from diffusers.models.transformers.transformer_wan import WanTransformerBlock
 
+        config = {
+            "patch_size": [1, 2, 2],
+            "num_attention_heads": 2,
+            "attention_head_dim": 16,
+            "in_channels": 16,
+            "out_channels": 16,
+            "text_dim": 32,
+            "freq_dim": 32,
+            "ffn_dim": 64,
+            "num_layers": 2,
+            "cross_attn_norm": False,
+            "qk_norm": "rms_norm_across_heads",
+            "eps": 1e-6,
+            "image_dim": None,
+            "added_kv_proj_dim": None,
+            "rope_max_seq_len": 32,
+        }
+        torch.manual_seed(0)
+        transformer = WanTransformer3DModel.from_config(config).to(_DEVICE).eval()
+        apply_rolling_kv_cache(transformer, RollingKVCacheConfig(window_size=-1))
+
+        blocks = [m for m in transformer.modules() if isinstance(m, WanTransformerBlock)]
+        self.assertEqual(len(blocks), config["num_layers"])
         for block in blocks:
-            self.assertTrue(hasattr(block.attn1, "_diffusers_hook"))
             self.assertIsNotNone(block.attn1._diffusers_hook.get_hook(_ROLLING_KV_CACHE_HOOK))
             if hasattr(block.attn2, "_diffusers_hook"):
                 self.assertIsNone(block.attn2._diffusers_hook.get_hook(_ROLLING_KV_CACHE_HOOK))
 
-    def test_cache_populated_after_first_pass(self):
-        hidden_states, timestep, encoder_hidden_states = _make_inputs()
-        _run_chunk(self.transformer, hidden_states, timestep, encoder_hidden_states)
-
-        block_state = _get_block_state(self.transformer)
-        self.assertIsNotNone(block_state.cached_key)
-        self.assertIsNotNone(block_state.cached_value)
-        self.assertEqual(block_state.cached_key.shape[1], _TOKENS_PER_CHUNK)
-        self.assertEqual(block_state.cache_start_token_offset, 0)
-
-    def test_cache_grows_after_second_chunk(self):
-        hs1, ts1, enc1 = _make_inputs()
-        hs2, ts2, enc2 = _make_inputs()
-        _run_chunk(self.transformer, hs1, ts1, enc1)
-        _run_chunk(self.transformer, hs2, ts2, enc2)
-
-        block_state = _get_block_state(self.transformer)
-        self.assertEqual(block_state.cached_key.shape[1], _TOKENS_PER_CHUNK * 2)
-        self.assertEqual(block_state.cache_start_token_offset, 0)
-
-    def test_window_size_limits_cache_and_tracks_start_offset(self):
-        transformer = _make_transformer()
-        transformer.eval()
-        apply_rolling_kv_cache(transformer, RollingKVCacheConfig(window_size=_TOKENS_PER_CHUNK))
-
-        hs1, ts1, enc1 = _make_inputs()
-        hs2, ts2, enc2 = _make_inputs()
-        _run_chunk(transformer, hs1, ts1, enc1)
-        _run_chunk(transformer, hs2, ts2, enc2)
-
-        block_state = _get_block_state(transformer)
-        self.assertEqual(block_state.cached_key.shape[1], _TOKENS_PER_CHUNK)
-        self.assertEqual(block_state.cache_start_token_offset, _TOKENS_PER_CHUNK)
-
-    def test_no_cache_update_when_flag_false(self):
-        cache_state = get_rolling_kv_cache_state(self.transformer)
-        hs1, ts1, enc1 = _make_inputs()
-        hs2, ts2, enc2 = _make_inputs()
-        _run_chunk(self.transformer, hs1, ts1, enc1)
-        before = _get_block_state(self.transformer).cached_key.clone()
-
-        cache_state.should_update_cache = False
-        _run_chunk(self.transformer, hs2, ts2, enc2)
-        after = _get_block_state(self.transformer).cached_key
-
-        torch.testing.assert_close(before, after)
-
-    def test_overwrite_truncates_suffix_and_matches_rebuilt_prefix(self):
-        hs_a, ts_a, enc = _make_inputs()
-        hs_b, ts_b, _ = _make_inputs()
-        hs_c, ts_c, _ = _make_inputs()
-        hs_d, _, _ = _make_inputs()
-
-        _run_chunk(self.transformer, hs_a, ts_a, enc)
-        _run_chunk(self.transformer, hs_b, ts_b, enc)
-        _run_chunk(self.transformer, hs_c, ts_c, enc)
-
-        cache_state = get_rolling_kv_cache_state(self.transformer)
-        cache_state.configure_cache_write(write_mode="overwrite", absolute_token_offset=_TOKENS_PER_CHUNK)
-        try:
-            _run_chunk(self.transformer, hs_d, ts_a, enc)
-        finally:
-            cache_state.clear_cache_write()
-
-        overwritten_state = _get_block_state(self.transformer)
-        self.assertEqual(overwritten_state.cached_key.shape[1], _TOKENS_PER_CHUNK * 2)
-        self.assertEqual(overwritten_state.cache_start_token_offset, 0)
-
-        fresh = _make_transformer()
-        fresh.load_state_dict(self.transformer.state_dict())
-        fresh.eval()
-        apply_rolling_kv_cache(fresh, RollingKVCacheConfig(window_size=-1))
-        _run_chunk(fresh, hs_a, ts_a, enc)
-        _run_chunk(fresh, hs_d, ts_a, enc)
-
-        expected_state = _get_block_state(fresh)
-        torch.testing.assert_close(overwritten_state.cached_key, expected_state.cached_key)
-        torch.testing.assert_close(overwritten_state.cached_value, expected_state.cached_value)
-
-    def test_cache_context_isolates_cond_and_uncond_states(self):
-        hs_a, ts, enc = _make_inputs()
-        hs_b, _, _ = _make_inputs()
-
-        with self.transformer.cache_context("cond"):
-            _run_chunk(self.transformer, hs_a, ts, enc)
-            cond_state = _get_block_state(self.transformer)
-            self.assertEqual(cond_state.cached_key.shape[1], _TOKENS_PER_CHUNK)
-
-        with self.transformer.cache_context("uncond"):
-            _run_chunk(self.transformer, hs_b, ts, enc)
-            uncond_state = _get_block_state(self.transformer)
-            self.assertEqual(uncond_state.cached_key.shape[1], _TOKENS_PER_CHUNK)
-
-        with self.transformer.cache_context("cond"):
-            cond_state = _get_block_state(self.transformer)
-            self.assertEqual(cond_state.cached_key.shape[1], _TOKENS_PER_CHUNK)
-            _run_chunk(self.transformer, hs_b, ts, enc)
-            self.assertEqual(cond_state.cached_key.shape[1], _TOKENS_PER_CHUNK * 2)
-
-    def test_reset_stateful_hooks_clears_cache(self):
-        hidden_states, timestep, encoder_hidden_states = _make_inputs()
-        _run_chunk(self.transformer, hidden_states, timestep, encoder_hidden_states)
-        self.assertIsNotNone(_get_block_state(self.transformer).cached_key)
-
-        self.transformer._diffusers_hook.reset_stateful_hooks()
-        block_state = _get_block_state(self.transformer)
-        self.assertIsNone(block_state.cached_key)
-        self.assertIsNone(block_state.cached_value)
-        self.assertEqual(block_state.cache_start_token_offset, 0)
+    def test_warns_when_attaching_to_untested_class(self):
+        # _IdentitySelfAttention is not in the tested set, so apply_rolling_kv_cache must warn.
+        with self.assertLogs("diffusers.hooks.rolling_kv_cache", level="WARNING") as captured:
+            apply_rolling_kv_cache(_IdentitySelfAttention(), RollingKVCacheConfig(window_size=-1))
+        self.assertTrue(
+            any("_IdentitySelfAttention" in msg and "untested" in msg for msg in captured.output),
+            captured.output,
+        )
 
 
 if __name__ == "__main__":
