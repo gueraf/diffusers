@@ -1,4 +1,4 @@
-# Copyright 2025 HuggingFace Inc.
+# Copyright 2026 HuggingFace Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,13 +18,15 @@ import torch
 
 from diffusers.hooks import RollingKVCacheConfig, apply_rolling_kv_cache, get_rolling_kv_cache_state
 from diffusers.hooks.rolling_kv_cache import (
+    _ROLLING_KV_CACHE_HOOK,
+    RollingKVAttentionProcessor,
     RollingKVCacheBlockState,
     RollingKVCacheState,
-    _ROLLING_KV_CACHE_HOOK,
-    _apply_rotary_emb,
 )
 from diffusers.models.transformers.transformer_wan import WanTransformerBlock
 
+
+_DEVICE = torch.device("cpu")
 
 WAN_TINY_CONFIG = {
     "patch_size": [1, 2, 2],
@@ -56,13 +58,13 @@ def _make_transformer(config=None):
     from diffusers import WanTransformer3DModel
 
     torch.manual_seed(0)
-    return WanTransformer3DModel.from_config(config or WAN_TINY_CONFIG)
+    return WanTransformer3DModel.from_config(config or WAN_TINY_CONFIG).to(_DEVICE)
 
 
 def _make_inputs(batch=_BATCH, t=_T, h=_H, w=_W, text_seq=_TEXT_SEQ_LEN, text_dim=_TEXT_DIM):
-    hidden_states = torch.randn(batch, _IN_CHANNELS, t, h, w)
-    timestep = torch.zeros(batch, dtype=torch.long)
-    encoder_hidden_states = torch.randn(batch, text_seq, text_dim)
+    hidden_states = torch.randn(batch, _IN_CHANNELS, t, h, w, device=_DEVICE)
+    timestep = torch.zeros(batch, dtype=torch.long, device=_DEVICE)
+    encoder_hidden_states = torch.randn(batch, text_seq, text_dim, device=_DEVICE)
     return hidden_states, timestep, encoder_hidden_states
 
 
@@ -106,6 +108,16 @@ class TestStateClasses(unittest.TestCase):
         self.assertEqual(state.write_mode, "append")
         self.assertIsNone(state.absolute_token_offset)
 
+    def test_configure_cache_write_rejects_offset_in_append_mode(self):
+        state = RollingKVCacheState()
+        with self.assertRaises(ValueError):
+            state.configure_cache_write(write_mode="append", absolute_token_offset=4)
+
+    def test_configure_cache_write_requires_offset_in_overwrite_mode(self):
+        state = RollingKVCacheState()
+        with self.assertRaises(ValueError):
+            state.configure_cache_write(write_mode="overwrite")
+
     def test_block_state_reset(self):
         state = RollingKVCacheBlockState()
         state.cached_key = torch.randn(1, 4, 2, 16)
@@ -118,12 +130,15 @@ class TestStateClasses(unittest.TestCase):
 
 
 class TestRotaryEmb(unittest.TestCase):
+    def setUp(self):
+        self.processor = RollingKVAttentionProcessor()
+
     def test_output_shape_and_dtype_preserved(self):
         x = torch.randn(1, 4, 2, 16, dtype=torch.bfloat16)
         freqs_cos = torch.ones(1, 4, 1, 16)
         freqs_sin = torch.zeros(1, 4, 1, 16)
 
-        out = _apply_rotary_emb(x, freqs_cos, freqs_sin)
+        out = self.processor.apply_rotary_emb(x, freqs_cos, freqs_sin)
 
         self.assertEqual(out.shape, x.shape)
         self.assertEqual(out.dtype, x.dtype)
@@ -140,7 +155,7 @@ class TestRotaryEmb(unittest.TestCase):
         ).flatten(-2)
         expected = expected.to(x.dtype)
 
-        out = _apply_rotary_emb(x, freqs_cos, freqs_sin)
+        out = self.processor.apply_rotary_emb(x, freqs_cos, freqs_sin)
 
         torch.testing.assert_close(out, expected)
 

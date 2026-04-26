@@ -1,4 +1,4 @@
-# Copyright 2025 The HuggingFace Team. All rights reserved.
+# Copyright 2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,11 +19,16 @@ from dataclasses import dataclass
 import torch
 
 from ..models.attention_dispatch import dispatch_attention_fn
+from ..utils import logging
 from .hooks import BaseState, HookRegistry, ModelHook, StateManager
+
+
+logger = logging.get_logger(__name__)
 
 
 _ROLLING_KV_CACHE_HOOK = "rolling_kv_cache"
 _ROLLING_KV_WRITE_MODES = {"append", "overwrite"}
+_TESTED_ATTENTION_CLASSES = frozenset({"WanAttention"})
 
 
 @dataclass
@@ -36,6 +41,72 @@ class RollingKVCacheConfig:
     """
 
     window_size: int = -1
+
+
+class RollingKVAttentionProcessor:
+    r"""Default attention preprocessor used by the rolling KV cache hook.
+
+    The defaults target Wan-style self-attention modules. To support a model with a different
+    attention layout — most often a different rotary embedding form — subclass and override the
+    relevant method, then pass the instance via `apply_rolling_kv_cache(..., attention_processor=...)`.
+    """
+
+    def prepare_qkv(
+        self,
+        attn: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if getattr(attn, "fused_projections", False):
+            query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
+        else:
+            query = attn.to_q(hidden_states)
+            key = attn.to_k(hidden_states)
+            value = attn.to_v(hidden_states)
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        query = query.unflatten(2, (attn.heads, -1))
+        key = key.unflatten(2, (attn.heads, -1))
+        value = value.unflatten(2, (attn.heads, -1))
+
+        if rotary_emb is not None:
+            query = self.apply_rotary_emb(query, *rotary_emb)
+            key = self.apply_rotary_emb(key, *rotary_emb)
+
+        return query, key, value
+
+    def apply_rotary_emb(
+        self,
+        hidden_states: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states_complex = torch.view_as_complex(
+            hidden_states.to(torch.float64).reshape(*hidden_states.shape[:-1], -1, 2)
+        )
+        freqs_complex = torch.complex(
+            freqs_cos[..., 0::2].to(torch.float64),
+            freqs_sin[..., 0::2].to(torch.float64),
+        )
+        out = torch.view_as_real(hidden_states_complex * freqs_complex).flatten(-2)
+        return out.type_as(hidden_states)
+
+    def post_attention(
+        self,
+        attn: torch.nn.Module,
+        attn_output: torch.Tensor,
+        query: torch.Tensor,
+    ) -> torch.Tensor:
+        out = attn_output.flatten(2, 3).type_as(query)
+        out = attn.to_out[0](out)
+        out = attn.to_out[1](out)
+        return out
+
+    def get_attention_backend(self, attn: torch.nn.Module):
+        processor = getattr(attn, "processor", None)
+        return getattr(processor, "_attention_backend", None)
 
 
 class RollingKVCacheState(BaseState):
@@ -51,10 +122,12 @@ class RollingKVCacheState(BaseState):
             raise ValueError(
                 f"`write_mode` must be one of {sorted(_ROLLING_KV_WRITE_MODES)}, but received {write_mode!r}."
             )
-        if absolute_token_offset is not None and absolute_token_offset < 0:
-            raise ValueError("`absolute_token_offset` must be >= 0.")
+        if write_mode == "append" and absolute_token_offset is not None:
+            raise ValueError("`absolute_token_offset` is only supported with `write_mode='overwrite'`.")
         if write_mode == "overwrite" and absolute_token_offset is None:
             raise ValueError("`absolute_token_offset` must be provided when `write_mode='overwrite'`.")
+        if absolute_token_offset is not None and absolute_token_offset < 0:
+            raise ValueError("`absolute_token_offset` must be >= 0.")
 
         self.write_mode = write_mode
         self.absolute_token_offset = absolute_token_offset
@@ -82,81 +155,31 @@ class RollingKVCacheBlockState(BaseState):
         self.cache_start_token_offset = 0
 
 
-def _get_qkv_projections(
-    attn: torch.nn.Module,
-    hidden_states: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if getattr(attn, "fused_projections", False):
-        query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
-    else:
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
-
-    return query, key, value
+def _ensure_state(state_manager: StateManager):
+    if state_manager._current_context is None:
+        state_manager.set_context("inference")
+    return state_manager.get_state()
 
 
-def _apply_rotary_emb(hidden_states: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor):
-    hidden_states_complex = torch.view_as_complex(
-        hidden_states.to(torch.float64).reshape(*hidden_states.shape[:-1], -1, 2)
-    )
-    freqs_complex = torch.complex(
-        freqs_cos[..., 0::2].to(torch.float64), freqs_sin[..., 0::2].to(torch.float64)
-    )
-    out = torch.view_as_real(hidden_states_complex * freqs_complex).flatten(-2)
-    return out.type_as(hidden_states)
-
-
-def _get_attention_backend(attn: torch.nn.Module):
-    processor = getattr(attn, "processor", None)
-    return getattr(processor, "_attention_backend", None)
-
-
-def _match_cached_batch_size(
-    cached_key: torch.Tensor | None,
-    cached_value: torch.Tensor | None,
-    batch_size: int,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    if cached_key is None:
-        return None, None
-
-    if cached_key.shape[0] == batch_size:
-        return cached_key, cached_value
-
-    if cached_key.shape[0] == 1:
-        expand_shape = (batch_size, -1, -1, -1)
-        return cached_key.expand(*expand_shape), cached_value.expand(*expand_shape)
-
-    raise ValueError(
-        "Rolling KV cache batch size mismatch. Use cache contexts for conditional/unconditional passes or reset the "
-        f"cache before changing batch size (cached batch={cached_key.shape[0]}, current batch={batch_size})."
-    )
-
-
-def _slice_cache_prefix(
+def _slice_cache_for_overwrite(
     block_state: RollingKVCacheBlockState,
-    absolute_token_offset: int | None,
+    absolute_token_offset: int,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, int]:
     cached_key = block_state.cached_key
     cached_value = block_state.cached_value
     cache_start = block_state.cache_start_token_offset
 
     if cached_key is None:
-        return None, None, absolute_token_offset if absolute_token_offset is not None else 0
-
-    if absolute_token_offset is None:
-        return cached_key, cached_value, cache_start
+        return None, None, absolute_token_offset
 
     cache_end = cache_start + cached_key.shape[1]
+    if absolute_token_offset > cache_end:
+        raise ValueError(
+            "`absolute_token_offset` points beyond the retained cache prefix. Reset the cache or prefill the "
+            "missing chunks before appending new ones."
+        )
     if absolute_token_offset < cache_start:
         return None, None, absolute_token_offset
-    if absolute_token_offset >= cache_end:
-        if absolute_token_offset > cache_end:
-            raise ValueError(
-                "`absolute_token_offset` points beyond the retained cache prefix. Reset the cache or prefill the "
-                "missing chunks before appending new ones."
-            )
-        return cached_key, cached_value, cache_start
 
     prefix_length = absolute_token_offset - cache_start
     return cached_key[:, :prefix_length], cached_value[:, :prefix_length], cache_start
@@ -188,11 +211,18 @@ def _is_self_attention_module(module: torch.nn.Module) -> bool:
 class RollingKVCacheHook(ModelHook):
     _is_stateful = True
 
-    def __init__(self, config: RollingKVCacheConfig, state_manager: StateManager, block_state_manager: StateManager):
+    def __init__(
+        self,
+        config: RollingKVCacheConfig,
+        state_manager: StateManager,
+        block_state_manager: StateManager,
+        attention_processor: RollingKVAttentionProcessor,
+    ):
         super().__init__()
         self.config = config
         self.state_manager = state_manager
         self.block_state_manager = block_state_manager
+        self.attention_processor = attention_processor
 
     def new_forward(
         self,
@@ -203,59 +233,35 @@ class RollingKVCacheHook(ModelHook):
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        if self.state_manager._current_context is None:
-            self.state_manager.set_context("inference")
-        if self.block_state_manager._current_context is None:
-            self.block_state_manager.set_context("inference")
         if encoder_hidden_states is not None:
             raise ValueError("Rolling KV cache only supports self-attention modules.")
 
-        shared_state: RollingKVCacheState = self.state_manager.get_state()
-        block_state: RollingKVCacheBlockState = self.block_state_manager.get_state()
+        shared_state: RollingKVCacheState = _ensure_state(self.state_manager)
+        block_state: RollingKVCacheBlockState = _ensure_state(self.block_state_manager)
+        proc = self.attention_processor
 
-        query, key, value = _get_qkv_projections(module, hidden_states)
-        query = module.norm_q(query)
-        key = module.norm_k(key)
-
-        query = query.unflatten(2, (module.heads, -1))
-        key = key.unflatten(2, (module.heads, -1))
-        value = value.unflatten(2, (module.heads, -1))
-
-        if rotary_emb is not None:
-            query = _apply_rotary_emb(query, *rotary_emb)
-            key = _apply_rotary_emb(key, *rotary_emb)
-
-        cache_token_offset = shared_state.absolute_token_offset
-        if (
-            shared_state.write_mode == "append"
-            and block_state.cached_key is not None
-            and cache_token_offset is not None
-        ):
-            expected_token_offset = block_state.cache_start_token_offset + block_state.cached_key.shape[1]
-            if cache_token_offset != expected_token_offset:
-                raise ValueError(
-                    "Append writes must continue from the current cache end. "
-                    f"Expected {expected_token_offset}, received {cache_token_offset}."
-                )
+        query, key, value = proc.prepare_qkv(module, hidden_states, rotary_emb)
 
         if shared_state.write_mode == "overwrite":
-            cached_key, cached_value, prefix_start = _slice_cache_prefix(block_state, cache_token_offset)
-        else:
-            cached_key, cached_value, prefix_start = (
-                block_state.cached_key,
-                block_state.cached_value,
-                block_state.cache_start_token_offset,
+            cached_key, cached_value, prefix_start = _slice_cache_for_overwrite(
+                block_state, shared_state.absolute_token_offset
             )
-
-        cached_key, cached_value = _match_cached_batch_size(cached_key, cached_value, key.shape[0])
+        else:
+            cached_key = block_state.cached_key
+            cached_value = block_state.cached_value
+            prefix_start = block_state.cache_start_token_offset
 
         if cached_key is not None:
+            if cached_key.shape[0] != key.shape[0]:
+                raise ValueError(
+                    f"Rolling KV cache batch size mismatch (cached={cached_key.shape[0]}, current={key.shape[0]}). "
+                    "Use `cache_context` to isolate cond/uncond passes or reset the cache before changing batch size."
+                )
             full_key = torch.cat([cached_key, key], dim=1)
             full_value = torch.cat([cached_value, value], dim=1)
         else:
             full_key = key
             full_value = value
-            prefix_start = cache_token_offset if cache_token_offset is not None else prefix_start
 
         if shared_state.should_update_cache:
             (
@@ -269,21 +275,16 @@ class RollingKVCacheHook(ModelHook):
                 self.config.window_size,
             )
 
-        hidden_states = dispatch_attention_fn(
+        attn_output = dispatch_attention_fn(
             query,
             full_key,
             full_value,
             attn_mask=attention_mask,
             dropout_p=0.0,
             is_causal=False,
-            backend=_get_attention_backend(module),
+            backend=proc.get_attention_backend(module),
         )
-        hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.type_as(query)
-        hidden_states = module.to_out[0](hidden_states)
-        hidden_states = module.to_out[1](hidden_states)
-
-        return hidden_states
+        return proc.post_attention(module, attn_output, query)
 
     def reset_state(self, module: torch.nn.Module):
         self.state_manager.reset()
@@ -291,34 +292,54 @@ class RollingKVCacheHook(ModelHook):
         return module
 
 
-def apply_rolling_kv_cache(module: torch.nn.Module, config: RollingKVCacheConfig | None = None) -> None:
-    r"""Apply rolling KV cache hooks to compatible self-attention modules."""
+def apply_rolling_kv_cache(
+    module: torch.nn.Module,
+    config: RollingKVCacheConfig | None = None,
+    attention_processor: RollingKVAttentionProcessor | None = None,
+) -> None:
+    r"""Apply rolling KV cache hooks to compatible self-attention modules.
+
+    The default `attention_processor` targets Wan-style attention modules. Pass a custom
+    `RollingKVAttentionProcessor` subclass for models with a different rotary embedding form
+    or projection layout.
+    """
     if config is None:
         config = RollingKVCacheConfig()
+    if attention_processor is None:
+        attention_processor = RollingKVAttentionProcessor()
 
     state_manager = StateManager(RollingKVCacheState)
     HookRegistry.check_if_exists_or_initialize(module)
 
-    for _, submodule in module.named_modules():
+    warned_classes: set[str] = set()
+    for submodule in module.modules():
         if not _is_self_attention_module(submodule):
             continue
 
+        cls_name = type(submodule).__name__
+        if cls_name not in _TESTED_ATTENTION_CLASSES and cls_name not in warned_classes:
+            warned_classes.add(cls_name)
+            logger.warning(
+                "apply_rolling_kv_cache: attaching to '%s' which is untested. The default "
+                "RollingKVAttentionProcessor targets Wan-style attention; if outputs look wrong, "
+                "subclass it (in particular `apply_rotary_emb`) and pass via `attention_processor=`.",
+                cls_name,
+            )
+
         block_state_manager = StateManager(RollingKVCacheBlockState)
-        hook = RollingKVCacheHook(config, state_manager, block_state_manager)
+        hook = RollingKVCacheHook(config, state_manager, block_state_manager, attention_processor)
         registry = HookRegistry.check_if_exists_or_initialize(submodule)
         registry.register_hook(hook, _ROLLING_KV_CACHE_HOOK)
 
 
 def get_rolling_kv_cache_state(module: torch.nn.Module) -> RollingKVCacheState | None:
     r"""Return the shared rolling KV cache state for a hooked module."""
-    for _, submodule in module.named_modules():
+    for submodule in module.modules():
         if not hasattr(submodule, "_diffusers_hook"):
             continue
 
         hook = submodule._diffusers_hook.get_hook(_ROLLING_KV_CACHE_HOOK)
         if hook is not None:
-            if hook.state_manager._current_context is None:
-                hook.state_manager.set_context("inference")
-            return hook.state_manager.get_state()
+            return _ensure_state(hook.state_manager)
 
     return None
