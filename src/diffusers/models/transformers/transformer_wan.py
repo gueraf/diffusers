@@ -182,6 +182,168 @@ def _wan_rolling_kv_trim_to_window(
     return key.detach(), value.detach(), cache_start
 
 
+def _apply_rotary_emb(
+    hidden_states: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+) -> torch.Tensor:
+    x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+    cos = freqs_cos[..., 0::2]
+    sin = freqs_sin[..., 1::2]
+    out = torch.empty_like(hidden_states)
+    out[..., 0::2] = x1 * cos - x2 * sin
+    out[..., 1::2] = x1 * sin + x2 * cos
+    return out.type_as(hidden_states)
+
+
+def _wan_self_attention(
+    attn: "WanAttention",
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
+    rolling_kv_cache: WanRollingKVCache | None,
+    block_idx: int | None,
+    backend,
+    parallel_config,
+) -> torch.Tensor:
+    query, key, value = _get_qkv_projections(attn, hidden_states, None)
+    query = attn.norm_q(query)
+    key = attn.norm_k(key)
+    query = query.unflatten(2, (attn.heads, -1))
+    key = key.unflatten(2, (attn.heads, -1))
+    value = value.unflatten(2, (attn.heads, -1))
+
+    if rotary_emb is not None:
+        query = _apply_rotary_emb(query, *rotary_emb)
+        key = _apply_rotary_emb(key, *rotary_emb)
+
+    if rolling_kv_cache is not None:
+        block_cache = rolling_kv_cache.block_caches[block_idx]
+        if rolling_kv_cache.write_mode == "overwrite":
+            cached_key, cached_value, prefix_start = _wan_rolling_kv_slice_for_overwrite(
+                block_cache, rolling_kv_cache.absolute_token_offset
+            )
+        else:
+            cached_key = block_cache.cached_key
+            cached_value = block_cache.cached_value
+            prefix_start = block_cache.cache_start_token_offset
+
+        if cached_key is not None:
+            key = torch.cat([cached_key, key], dim=1)
+            value = torch.cat([cached_value, value], dim=1)
+
+        if rolling_kv_cache.should_update:
+            (
+                block_cache.cached_key,
+                block_cache.cached_value,
+                block_cache.cache_start_token_offset,
+            ) = _wan_rolling_kv_trim_to_window(key, value, prefix_start, rolling_kv_cache.window_size)
+
+    hidden_states = dispatch_attention_fn(
+        query,
+        key,
+        value,
+        attn_mask=attention_mask,
+        dropout_p=0.0,
+        is_causal=False,
+        backend=backend,
+        # Reference: https://github.com/huggingface/diffusers/pull/12909
+        parallel_config=parallel_config,
+    )
+    hidden_states = hidden_states.flatten(2, 3)
+    return hidden_states.type_as(query)
+
+
+def _wan_cross_attention(
+    attn: "WanAttention",
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    rolling_kv_cache: WanRollingKVCache | None,
+    block_idx: int | None,
+    backend,
+) -> torch.Tensor:
+    # Split image and text encoder hidden states for I2V
+    encoder_hidden_states_img = None
+    if attn.add_k_proj is not None:
+        # 512 is the context length of the text encoder, hardcoded for now
+        image_context_length = encoder_hidden_states.shape[1] - 512
+        encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
+        encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
+
+    # Text encoder K/V: compute fresh or reuse from cache
+    use_cross_cache = rolling_kv_cache is not None and rolling_kv_cache.cache_cross_attention
+    if use_cross_cache:
+        block_cache = rolling_kv_cache.block_caches[block_idx]
+        query = attn.to_q(hidden_states)
+        query = attn.norm_q(query)
+        query = query.unflatten(2, (attn.heads, -1))
+        if block_cache.cached_cross_key is None:
+            _, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+            key = attn.norm_k(key)
+            key = key.unflatten(2, (attn.heads, -1))
+            value = value.unflatten(2, (attn.heads, -1))
+            block_cache.cached_cross_key = key.detach()
+            block_cache.cached_cross_value = value.detach()
+        else:
+            key = block_cache.cached_cross_key
+            value = block_cache.cached_cross_value
+    else:
+        query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+        query = query.unflatten(2, (attn.heads, -1))
+        key = key.unflatten(2, (attn.heads, -1))
+        value = value.unflatten(2, (attn.heads, -1))
+
+    hidden_states = dispatch_attention_fn(
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=False,
+        backend=backend,
+        # Reference: https://github.com/huggingface/diffusers/pull/12909
+        parallel_config=None,
+    )
+    hidden_states = hidden_states.flatten(2, 3)
+    hidden_states = hidden_states.type_as(query)
+
+    # I2V image token cross-attention
+    if encoder_hidden_states_img is not None:
+        if use_cross_cache:
+            if block_cache.cached_cross_key_img is None:
+                key_img, value_img = _get_added_kv_projections(attn, encoder_hidden_states_img)
+                key_img = attn.norm_added_k(key_img)
+                key_img = key_img.unflatten(2, (attn.heads, -1))
+                value_img = value_img.unflatten(2, (attn.heads, -1))
+                block_cache.cached_cross_key_img = key_img.detach()
+                block_cache.cached_cross_value_img = value_img.detach()
+            else:
+                key_img = block_cache.cached_cross_key_img
+                value_img = block_cache.cached_cross_value_img
+        else:
+            key_img, value_img = _get_added_kv_projections(attn, encoder_hidden_states_img)
+            key_img = attn.norm_added_k(key_img)
+            key_img = key_img.unflatten(2, (attn.heads, -1))
+            value_img = value_img.unflatten(2, (attn.heads, -1))
+
+        hidden_states_img = dispatch_attention_fn(
+            query,
+            key_img,
+            value_img,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            backend=backend,
+            # Reference: https://github.com/huggingface/diffusers/pull/12909
+            parallel_config=None,
+        )
+        hidden_states = hidden_states + hidden_states_img.flatten(2, 3).type_as(query)
+
+    return hidden_states
+
+
 class WanAttnProcessor:
     _attention_backend = None
     _parallel_config = None
@@ -202,136 +364,16 @@ class WanAttnProcessor:
         rolling_kv_cache: WanRollingKVCache | None = None,
         block_idx: int | None = None,
     ) -> torch.Tensor:
-        is_self_attention = encoder_hidden_states is None
-
-        encoder_hidden_states_img = None
-        if attn.add_k_proj is not None:
-            # 512 is the context length of the text encoder, hardcoded for now
-            image_context_length = encoder_hidden_states.shape[1] - 512
-            encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
-            encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
-
-        # Cross-attention with KV caching: only compute Q; reuse cached K/V
-        if not is_self_attention and rolling_kv_cache is not None and rolling_kv_cache.cache_cross_attention:
-            block_cache = rolling_kv_cache.block_caches[block_idx]
-            query = attn.to_q(hidden_states)
-            query = attn.norm_q(query)
-            query = query.unflatten(2, (attn.heads, -1))
-            if block_cache.cached_cross_key is None:
-                _, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
-                key = attn.norm_k(key)
-                key = key.unflatten(2, (attn.heads, -1))
-                value = value.unflatten(2, (attn.heads, -1))
-                block_cache.cached_cross_key = key.detach()
-                block_cache.cached_cross_value = value.detach()
-            else:
-                key = block_cache.cached_cross_key
-                value = block_cache.cached_cross_value
-        else:
-            query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
-            query = attn.norm_q(query)
-            key = attn.norm_k(key)
-            query = query.unflatten(2, (attn.heads, -1))
-            key = key.unflatten(2, (attn.heads, -1))
-            value = value.unflatten(2, (attn.heads, -1))
-
-        if rotary_emb is not None:
-
-            def apply_rotary_emb(
-                hidden_states: torch.Tensor,
-                freqs_cos: torch.Tensor,
-                freqs_sin: torch.Tensor,
-            ):
-                x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
-                cos = freqs_cos[..., 0::2]
-                sin = freqs_sin[..., 1::2]
-                out = torch.empty_like(hidden_states)
-                out[..., 0::2] = x1 * cos - x2 * sin
-                out[..., 1::2] = x1 * sin + x2 * cos
-                return out.type_as(hidden_states)
-
-            query = apply_rotary_emb(query, *rotary_emb)
-            key = apply_rotary_emb(key, *rotary_emb)
-
-        # Self-attention rolling KV cache
-        if is_self_attention and rolling_kv_cache is not None:
-            block_cache = rolling_kv_cache.block_caches[block_idx]
-            if rolling_kv_cache.write_mode == "overwrite":
-                cached_key, cached_value, prefix_start = _wan_rolling_kv_slice_for_overwrite(
-                    block_cache, rolling_kv_cache.absolute_token_offset
-                )
-            else:
-                cached_key = block_cache.cached_key
-                cached_value = block_cache.cached_value
-                prefix_start = block_cache.cache_start_token_offset
-
-            if cached_key is not None:
-                key = torch.cat([cached_key, key], dim=1)
-                value = torch.cat([cached_value, value], dim=1)
-
-            if rolling_kv_cache.should_update:
-                (
-                    block_cache.cached_key,
-                    block_cache.cached_value,
-                    block_cache.cache_start_token_offset,
-                ) = _wan_rolling_kv_trim_to_window(key, value, prefix_start, rolling_kv_cache.window_size)
-
-        # I2V task
-        hidden_states_img = None
-        if encoder_hidden_states_img is not None:
-            if (
-                not is_self_attention
-                and rolling_kv_cache is not None
-                and rolling_kv_cache.cache_cross_attention
-            ):
-                block_cache = rolling_kv_cache.block_caches[block_idx]
-                if block_cache.cached_cross_key_img is None:
-                    key_img, value_img = _get_added_kv_projections(attn, encoder_hidden_states_img)
-                    key_img = attn.norm_added_k(key_img)
-                    key_img = key_img.unflatten(2, (attn.heads, -1))
-                    value_img = value_img.unflatten(2, (attn.heads, -1))
-                    block_cache.cached_cross_key_img = key_img.detach()
-                    block_cache.cached_cross_value_img = value_img.detach()
-                else:
-                    key_img = block_cache.cached_cross_key_img
-                    value_img = block_cache.cached_cross_value_img
-            else:
-                key_img, value_img = _get_added_kv_projections(attn, encoder_hidden_states_img)
-                key_img = attn.norm_added_k(key_img)
-                key_img = key_img.unflatten(2, (attn.heads, -1))
-                value_img = value_img.unflatten(2, (attn.heads, -1))
-
-            hidden_states_img = dispatch_attention_fn(
-                query,
-                key_img,
-                value_img,
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=False,
-                backend=self._attention_backend,
-                # Reference: https://github.com/huggingface/diffusers/pull/12909
-                parallel_config=None,
+        if encoder_hidden_states is None:
+            hidden_states = _wan_self_attention(
+                attn, hidden_states, attention_mask, rotary_emb,
+                rolling_kv_cache, block_idx, self._attention_backend, self._parallel_config,
             )
-            hidden_states_img = hidden_states_img.flatten(2, 3)
-            hidden_states_img = hidden_states_img.type_as(query)
-
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            backend=self._attention_backend,
-            # Reference: https://github.com/huggingface/diffusers/pull/12909
-            parallel_config=(self._parallel_config if is_self_attention else None),
-        )
-        hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.type_as(query)
-
-        if hidden_states_img is not None:
-            hidden_states = hidden_states + hidden_states_img
-
+        else:
+            hidden_states = _wan_cross_attention(
+                attn, hidden_states, encoder_hidden_states,
+                rolling_kv_cache, block_idx, self._attention_backend,
+            )
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
         return hidden_states
