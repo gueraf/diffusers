@@ -65,6 +65,123 @@ def _get_added_kv_projections(attn: "WanAttention", encoder_hidden_states_img: t
     return key_img, value_img
 
 
+class WanRollingKVBlockCache:
+    """Per-block rolling KV cache state for autoregressive WAN inference.
+
+    Stores post-norm, post-RoPE self-attention key/value tensors from previous chunks.
+    Tensor shape: ``(batch_size, cached_seq_len, num_heads, head_dim)``.
+    Also holds optional cross-attention caches when ``WanRollingKVCache.cache_cross_attention`` is enabled.
+    """
+
+    def __init__(self):
+        self.cached_key: torch.Tensor | None = None
+        self.cached_value: torch.Tensor | None = None
+        self.cache_start_token_offset: int = 0
+        self.cached_cross_key: torch.Tensor | None = None
+        self.cached_cross_value: torch.Tensor | None = None
+        self.cached_cross_key_img: torch.Tensor | None = None
+        self.cached_cross_value_img: torch.Tensor | None = None
+
+    def reset(self):
+        self.cached_key = None
+        self.cached_value = None
+        self.cache_start_token_offset = 0
+        self.cached_cross_key = None
+        self.cached_cross_value = None
+        self.cached_cross_key_img = None
+        self.cached_cross_value_img = None
+
+
+class WanRollingKVCache:
+    """Rolling self-attention KV cache for autoregressive WAN video generation.
+
+    Holds a per-block ``WanRollingKVBlockCache`` for every transformer block, plus shared
+    write-control state. Pass an instance via ``attention_kwargs`` on each transformer forward
+    call.
+
+    Args:
+        num_blocks (`int`): Number of transformer blocks (``len(transformer.blocks)``).
+        window_size (`int`, defaults to ``-1``): Maximum cached tokens per block. ``-1`` keeps
+            the full prefix.
+        cache_cross_attention (`bool`, defaults to ``False``): Whether to also cache
+            cross-attention K/V projections. Since the conditioning embeddings are constant
+            across chunks, this avoids redundant projection work.
+
+    Example::
+
+        cache = WanRollingKVCache(num_blocks=len(transformer.blocks), window_size=8000)
+        transformer(..., attention_kwargs={"rolling_kv_cache": cache})
+    """
+
+    def __init__(self, num_blocks: int, window_size: int = -1, cache_cross_attention: bool = False):
+        self.block_caches: list[WanRollingKVBlockCache] = [WanRollingKVBlockCache() for _ in range(num_blocks)]
+        self.window_size: int = window_size
+        self.cache_cross_attention: bool = cache_cross_attention
+        self.should_update: bool = True
+        self.write_mode: str = "append"
+        self.absolute_token_offset: int | None = None
+
+    def configure_write(self, write_mode: str = "append", absolute_token_offset: int | None = None) -> None:
+        """Set the write mode for the next forward pass.
+
+        Args:
+            write_mode: ``"append"`` grows the prefix; ``"overwrite"`` replaces cached tokens
+                starting at ``absolute_token_offset``.
+            absolute_token_offset: Required for ``"overwrite"``, must be ``>= 0``.
+        """
+        if write_mode not in ("append", "overwrite"):
+            raise ValueError(f"`write_mode` must be 'append' or 'overwrite', got {write_mode!r}.")
+        if write_mode == "append" and absolute_token_offset is not None:
+            raise ValueError("`absolute_token_offset` is only valid with write_mode='overwrite'.")
+        if write_mode == "overwrite" and absolute_token_offset is None:
+            raise ValueError("`absolute_token_offset` must be set when write_mode='overwrite'.")
+        self.write_mode = write_mode
+        self.absolute_token_offset = absolute_token_offset
+
+    def reset(self) -> None:
+        """Clear all cached K/V tensors and reset write-control state."""
+        for bc in self.block_caches:
+            bc.reset()
+        self.should_update = True
+        self.write_mode = "append"
+        self.absolute_token_offset = None
+
+
+def _wan_rolling_kv_slice_for_overwrite(
+    block_cache: WanRollingKVBlockCache,
+    absolute_token_offset: int,
+) -> tuple["torch.Tensor | None", "torch.Tensor | None", int]:
+    cached_key = block_cache.cached_key
+    if cached_key is None:
+        return None, None, absolute_token_offset
+
+    cache_start = block_cache.cache_start_token_offset
+    cache_end = cache_start + cached_key.shape[1]
+    if absolute_token_offset > cache_end:
+        raise ValueError(
+            "`absolute_token_offset` points beyond the retained cache. Reset the cache or prefill "
+            "missing chunks before writing new ones."
+        )
+    if absolute_token_offset < cache_start:
+        return None, None, absolute_token_offset
+    prefix_len = absolute_token_offset - cache_start
+    return cached_key[:, :prefix_len], block_cache.cached_value[:, :prefix_len], cache_start
+
+
+def _wan_rolling_kv_trim_to_window(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cache_start: int,
+    window_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    if window_size > 0 and key.shape[1] > window_size:
+        trim = key.shape[1] - window_size
+        key = key[:, trim:]
+        value = value[:, trim:]
+        cache_start += trim
+    return key.detach(), value.detach(), cache_start
+
+
 class WanAttnProcessor:
     _attention_backend = None
     _parallel_config = None
@@ -82,7 +199,11 @@ class WanAttnProcessor:
         encoder_hidden_states: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rolling_kv_cache: WanRollingKVCache | None = None,
+        block_idx: int | None = None,
     ) -> torch.Tensor:
+        is_self_attention = encoder_hidden_states is None
+
         encoder_hidden_states_img = None
         if attn.add_k_proj is not None:
             # 512 is the context length of the text encoder, hardcoded for now
@@ -90,14 +211,29 @@ class WanAttnProcessor:
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
 
-        query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
-
-        query = attn.norm_q(query)
-        key = attn.norm_k(key)
-
-        query = query.unflatten(2, (attn.heads, -1))
-        key = key.unflatten(2, (attn.heads, -1))
-        value = value.unflatten(2, (attn.heads, -1))
+        # Cross-attention with KV caching: only compute Q; reuse cached K/V
+        if not is_self_attention and rolling_kv_cache is not None and rolling_kv_cache.cache_cross_attention:
+            block_cache = rolling_kv_cache.block_caches[block_idx]
+            query = attn.to_q(hidden_states)
+            query = attn.norm_q(query)
+            query = query.unflatten(2, (attn.heads, -1))
+            if block_cache.cached_cross_key is None:
+                _, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+                key = attn.norm_k(key)
+                key = key.unflatten(2, (attn.heads, -1))
+                value = value.unflatten(2, (attn.heads, -1))
+                block_cache.cached_cross_key = key.detach()
+                block_cache.cached_cross_value = value.detach()
+            else:
+                key = block_cache.cached_cross_key
+                value = block_cache.cached_cross_value
+        else:
+            query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+            query = attn.norm_q(query)
+            key = attn.norm_k(key)
+            query = query.unflatten(2, (attn.heads, -1))
+            key = key.unflatten(2, (attn.heads, -1))
+            value = value.unflatten(2, (attn.heads, -1))
 
         if rotary_emb is not None:
 
@@ -117,14 +253,53 @@ class WanAttnProcessor:
             query = apply_rotary_emb(query, *rotary_emb)
             key = apply_rotary_emb(key, *rotary_emb)
 
+        # Self-attention rolling KV cache
+        if is_self_attention and rolling_kv_cache is not None:
+            block_cache = rolling_kv_cache.block_caches[block_idx]
+            if rolling_kv_cache.write_mode == "overwrite":
+                cached_key, cached_value, prefix_start = _wan_rolling_kv_slice_for_overwrite(
+                    block_cache, rolling_kv_cache.absolute_token_offset
+                )
+            else:
+                cached_key = block_cache.cached_key
+                cached_value = block_cache.cached_value
+                prefix_start = block_cache.cache_start_token_offset
+
+            if cached_key is not None:
+                key = torch.cat([cached_key, key], dim=1)
+                value = torch.cat([cached_value, value], dim=1)
+
+            if rolling_kv_cache.should_update:
+                (
+                    block_cache.cached_key,
+                    block_cache.cached_value,
+                    block_cache.cache_start_token_offset,
+                ) = _wan_rolling_kv_trim_to_window(key, value, prefix_start, rolling_kv_cache.window_size)
+
         # I2V task
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
-            key_img, value_img = _get_added_kv_projections(attn, encoder_hidden_states_img)
-            key_img = attn.norm_added_k(key_img)
-
-            key_img = key_img.unflatten(2, (attn.heads, -1))
-            value_img = value_img.unflatten(2, (attn.heads, -1))
+            if (
+                not is_self_attention
+                and rolling_kv_cache is not None
+                and rolling_kv_cache.cache_cross_attention
+            ):
+                block_cache = rolling_kv_cache.block_caches[block_idx]
+                if block_cache.cached_cross_key_img is None:
+                    key_img, value_img = _get_added_kv_projections(attn, encoder_hidden_states_img)
+                    key_img = attn.norm_added_k(key_img)
+                    key_img = key_img.unflatten(2, (attn.heads, -1))
+                    value_img = value_img.unflatten(2, (attn.heads, -1))
+                    block_cache.cached_cross_key_img = key_img.detach()
+                    block_cache.cached_cross_value_img = value_img.detach()
+                else:
+                    key_img = block_cache.cached_cross_key_img
+                    value_img = block_cache.cached_cross_value_img
+            else:
+                key_img, value_img = _get_added_kv_projections(attn, encoder_hidden_states_img)
+                key_img = attn.norm_added_k(key_img)
+                key_img = key_img.unflatten(2, (attn.heads, -1))
+                value_img = value_img.unflatten(2, (attn.heads, -1))
 
             hidden_states_img = dispatch_attention_fn(
                 query,
@@ -149,7 +324,7 @@ class WanAttnProcessor:
             is_causal=False,
             backend=self._attention_backend,
             # Reference: https://github.com/huggingface/diffusers/pull/12909
-            parallel_config=(self._parallel_config if encoder_hidden_states is None else None),
+            parallel_config=(self._parallel_config if is_self_attention else None),
         )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
@@ -392,7 +567,7 @@ class WanRotaryPosEmbed(nn.Module):
         self.register_buffer("freqs_cos", torch.cat(freqs_cos, dim=1), persistent=False)
         self.register_buffer("freqs_sin", torch.cat(freqs_sin, dim=1), persistent=False)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, frame_offset: int = 0) -> torch.Tensor:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.patch_size
         ppf, pph, ppw = num_frames // p_t, height // p_h, width // p_w
@@ -402,11 +577,11 @@ class WanRotaryPosEmbed(nn.Module):
         freqs_cos = self.freqs_cos.split(split_sizes, dim=1)
         freqs_sin = self.freqs_sin.split(split_sizes, dim=1)
 
-        freqs_cos_f = freqs_cos[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_cos_f = freqs_cos[0][frame_offset:frame_offset + ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_cos_h = freqs_cos[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_cos_w = freqs_cos[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
 
-        freqs_sin_f = freqs_sin[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_sin_f = freqs_sin[0][frame_offset:frame_offset + ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_sin_h = freqs_sin[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_sin_w = freqs_sin[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
 
@@ -465,6 +640,8 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         rotary_emb: torch.Tensor,
+        rolling_kv_cache: WanRollingKVCache | None = None,
+        block_idx: int | None = None,
     ) -> torch.Tensor:
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
@@ -486,12 +663,18 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-        attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb)
+        attn_output = self.attn1(
+            norm_hidden_states, None, None, rotary_emb,
+            rolling_kv_cache=rolling_kv_cache, block_idx=block_idx,
+        )
         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
         norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
-        attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, None, None)
+        attn_output = self.attn2(
+            norm_hidden_states, encoder_hidden_states, None, None,
+            rolling_kv_cache=rolling_kv_cache, block_idx=block_idx,
+        )
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
@@ -634,6 +817,7 @@ class WanTransformer3DModel(
         encoder_hidden_states_image: torch.Tensor | None = None,
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
+        frame_offset: int = 0,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
@@ -641,7 +825,7 @@ class WanTransformer3DModel(
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        rotary_emb = self.rope(hidden_states)
+        rotary_emb = self.rope(hidden_states, frame_offset=frame_offset)
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
@@ -666,15 +850,21 @@ class WanTransformer3DModel(
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
+        rolling_kv_cache: WanRollingKVCache | None = (attention_kwargs or {}).pop("rolling_kv_cache", None)
+
         # 4. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:
-            for block in self.blocks:
+            for block_idx, block in enumerate(self.blocks):
                 hidden_states = self._gradient_checkpointing_func(
-                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
+                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb,
+                    rolling_kv_cache, block_idx,
                 )
         else:
-            for block in self.blocks:
-                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+            for block_idx, block in enumerate(self.blocks):
+                hidden_states = block(
+                    hidden_states, encoder_hidden_states, timestep_proj, rotary_emb,
+                    rolling_kv_cache=rolling_kv_cache, block_idx=block_idx,
+                )
 
         # 5. Output norm, projection & unpatchify
         if temb.ndim == 3:
